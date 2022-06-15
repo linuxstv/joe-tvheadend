@@ -19,12 +19,13 @@
 #ifndef PACKET_H_
 #define PACKET_H_
 
+#include "esstream.h"
+
 struct memoryinfo;
 
 /**
  * Packet buffer
  */
-
 typedef struct pktbuf {
   int pb_refcount;
   int pb_err;
@@ -69,6 +70,7 @@ typedef struct th_pkt {
       uint16_t pkt_aspect_den;
     } v;
     struct {
+      uint8_t pkt_keyframe;
       uint8_t pkt_channels;
       uint8_t pkt_sri;
       uint8_t pkt_ext_sri;
@@ -80,7 +82,6 @@ typedef struct th_pkt {
 
 } th_pkt_t;
 
-
 /**
  * A packet reference
  */
@@ -89,6 +90,7 @@ typedef struct th_pktref {
   th_pkt_t *pr_pkt;
 } th_pktref_t;
 
+TAILQ_HEAD(th_pktref_queue, th_pktref);
 
 /**
  *
@@ -111,7 +113,13 @@ void pktref_clear_queue(struct th_pktref_queue *q);
 // Reference count is transfered to queue
 void pktref_enqueue(struct th_pktref_queue *q, th_pkt_t *pkt);
 
+// Reference count is transfered to queue
+void pktref_enqueue_sorted(struct th_pktref_queue *q, th_pkt_t *pkt,
+                           int (*cmp)(const void *, const void *));
+
 void pktref_remove(struct th_pktref_queue *q, th_pktref_t *pr);
+
+th_pkt_t *pktref_first(struct th_pktref_queue *q);
 
 th_pkt_t *pktref_get_first(struct th_pktref_queue *q);
 
@@ -120,7 +128,7 @@ void pktref_insert_head(struct th_pktref_queue *q, th_pkt_t *pkt);
 #define PKTREF_FOREACH(item, queue) TAILQ_FOREACH((item), (queue), pr_link)
 
 th_pkt_t *pkt_alloc(streaming_component_type_t type,
-                    const void *data, size_t datalen,
+                    const uint8_t *data, size_t datalen,
                     int64_t pts, int64_t dts, int64_t pcr);
 
 th_pkt_t *pkt_copy_shallow(th_pkt_t *pkt);
@@ -149,7 +157,7 @@ void pktbuf_destroy(pktbuf_t *pb);
 
 pktbuf_t *pktbuf_ref_inc(pktbuf_t *pb);
 
-pktbuf_t *pktbuf_alloc(const void *data, size_t size);
+pktbuf_t *pktbuf_alloc(const uint8_t *data, size_t size);
 
 pktbuf_t *pktbuf_make(void *data, size_t size);
 

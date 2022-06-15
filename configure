@@ -19,7 +19,9 @@ test -z "$PKG_CONFIG" && PKG_CONFIG=pkg-config
 OPTIONS=(
   "pie:yes"
   "ccdebug:no"
+  "cardclient:auto"
   "cwc:yes"
+  "cccam:yes"
   "capmt:yes"
   "constcw:yes"
   "linuxdvb:yes"
@@ -32,7 +34,6 @@ OPTIONS=(
   "dvbscan:yes"
   "timeshift:yes"
   "trace:yes"
-  "imagecache:auto"
   "avahi:auto"
   "zlib:auto"
   "libav:auto"
@@ -47,28 +48,33 @@ OPTIONS=(
   "libtheora_static:yes"
   "libvorbis:yes"
   "libvorbis_static:yes"
-  "libfdkaac:yes"
+  "libfdkaac:no"
   "libfdkaac_static:yes"
-  "nvenc:auto"
-  "qsv:no"
-  "libmfx_static:yes"
+  "libopus:yes"
+  "libopus_static:yes"
+  "nvenc:no"
+  "vaapi:auto"
+  "mmal:no"
+  "omx:no"
   "inotify:auto"
   "epoll:auto"
+  "pcre:auto"
+  "pcre2:auto"
   "uriparser:auto"
   "ccache:auto"
   "tvhcsa:auto"
   "bundle:no"
   "pngquant:no"
-  "dvbcsa:no"
-  "dvben50221:auto"
   "kqueue:no"
   "dbus_1:auto"
   "android:no"
-  "tsdebug:no"
   "gtimer_check:no"
   "slow_memoryinfo:no"
   "libsystemd_daemon:no"
-  "bintray_cache:yes"
+  "pcloud_cache:yes"
+  "ddci:yes"
+  "cclang_threadsan:no"
+  "gperftools:no"
 )
 
 #
@@ -137,10 +143,28 @@ fi
 
 # Valiate compiler
 check_cc || die 'No C compiler found'
-check_cc_header execinfo
+# We only want libunwind on non-linux plaforms where we have had bad
+# stack traces from existing implementation.
+if [ ${PLATFORM} = "freebsd" ]; then
+    check_cc_header libunwind
+    # If we don't have libunwind then fallback to execinfo.
+    if ! enabled libunwind
+    then
+        check_cc_header execinfo
+    fi
+
+else
+    check_cc_header execinfo
+fi
 check_cc_option mmx
 check_cc_option sse2
 check_cc_optionW unused-result
+# Some options from https://wiki.debian.org/Hardening
+check_cc_optionf stack-protector
+check_cc_optionf stack-protector-strong
+# Useful for multi-threaded programs
+check_cc_optionf stack-check
+check_cc_optionf PIE
 
 if check_cc '
 #if !defined(__clang__)
@@ -152,8 +176,33 @@ else
   COMPILER=gcc
 fi
 
+check_cc_snippet strlcat '#include <string.h>
+int test(int argc, char **argv) {
+  char dst[10];
+  strlcat("test", dst, sizeof(dst));
+  return 0;
+}'
+
+check_cc_snippet strlcpy '#include <string.h>
+int test(int argc, char **argv) {
+  char dst[10];
+  strlcpy("test", dst, sizeof(dst));
+  return 0;
+}'
+
+check_cc_snippet fdatasync '#include <unistd.h>
+int test(int argc, char **argv) {
+  fdatasync(0);
+  return 0;
+}'
+
 check_cc_snippet getloadavg '#include <stdlib.h>
 void test() { getloadavg(NULL,0); }'
+
+check_cc_snippet atomic32 '#include <stdint.h>
+int test(int *ptr){
+return __sync_fetch_and_add(ptr, 1);
+}'
 
 check_cc_snippet atomic64 '#include <stdint.h>
 uint64_t test(uint64_t *ptr){
@@ -164,6 +213,12 @@ check_cc_snippet atomic_time_t '#include <stdint.h>
 #include <time.h>
 uint64_t test(time_t *ptr){
 return __sync_fetch_and_add(ptr, 1);
+}'
+
+check_cc_snippet atomic_ptr '#include <stdint.h>
+#include <time.h>
+void *test(void * volatile *ptr){
+return __sync_fetch_and_add(ptr, (void *)1);
 }'
 
 check_cc_snippet bitops64 '#include <stdint.h>
@@ -264,21 +319,10 @@ int test(void)
 }
 ' -liconv
 
-if enabled_or_auto dvben50221; then
-  check_cc_snippet libdvben50221 '
-  #include <libdvben50221/en50221_session.h>
-  #define TEST test
-  int test(void)
-  {
-    struct en50221_transport_layer *tl = en50221_tl_create(5, 32);
-    return 0;
-  }
-  ' '-ldvben50221 -ldvbapi -lucsi'
-  if enabled libdvben50221; then
-    enable dvben50221
-  else
-    disable dvben50221
-  fi
+if enabled libiconv; then
+  printf "    ^ using external iconv library\n"
+else
+  printf "    ^ using build-in glibc iconv routines\n"
 fi
 
 check_cc_snippet ifnames '
@@ -290,6 +334,13 @@ int test(void)
   return 0;
 }
 '
+
+check_cc_snippet cclang_threadsan '
+int test(void){
+#if __has_feature(thread_sanitizer)
+  return 0;
+#endif
+}'
 
 #
 # Python
@@ -336,9 +387,18 @@ check_cc_header 'linux/dvb/version' linuxdvbapi
 if enabled_or_auto linuxdvb; then
   if enabled linuxdvbapi; then
     enable linuxdvb
+    enable linuxdvb_ca
   elif enabled linuxdvb; then
     die "Linux DVB API not found (use --disable-linuxdvb)"
   fi
+fi
+
+if enabled linuxdvb; then
+  if enabled_or_auto ddci; then
+    enable ddci
+  fi
+else
+  disable ddci
 fi
 
 #
@@ -359,6 +419,9 @@ else
 
 fi
 
+if enabled libunwind; then
+    LDFLAGS="$LDFLAGS -lunwind"
+fi
 #
 # Gzip
 #
@@ -382,6 +445,32 @@ fi
 #
 if enabled_or_auto satip_client; then
   enable upnp
+fi
+
+#
+# PCRE2
+#
+if enabled_or_auto pcre2; then
+  if check_pkg libpcre2-8; then
+    enable pcre2
+  elif enabled pcre2; then
+    die "pcre2 development support not found (use --disable-pcre2)"
+  fi
+fi
+
+#
+# PCRE
+#
+if enabled pcre2; then
+  disable pcre
+else
+  if enabled_or_auto pcre; then
+    if check_pkg libpcre; then
+      enable pcre
+    elif enabled pcre; then
+      die "pcre development support not found (use --disable-pcre)"
+    fi
+  fi
 fi
 
 #
@@ -488,52 +577,56 @@ if enabled ffmpeg_static; then
     disable libfdkaac_static
   fi
 
-  # nvenc
-  if enabled_or_auto nvenc; then
-    if check_cc_header nvEncodeAPI; then
-      enable nvenc
-    elif enabled nvenc; then
-      die "NVENC library (https://developer.nvidia.com/nvidia-video-codec-sdk) not found"
+  # libopus
+  if enabled libopus; then
+    if disabled libopus_static; then
+      check_pkg opus ">=1.1" || die "opus package not found"
     fi
-  fi
-
-  # qsv
-  if enabled qsv; then
-    if disabled libmfx_static; then
-      check_pkg libmfx ">=1.16" || die "libmfx package not found"
-    else
-      check_bin autoreconf       || die "autoreconf not found"
-      check_bin libtool          || die "libtool not found"
-      check_bin libtoolize       || die "libtoolize not found"
-      check_cc_lib stdc++ stdcpp || die "libstdc++ not found"
-    fi
-    enable vaapi
   else
-    disable libmfx_static
+    disable libopus_static
   fi
 
-  # vaapi
-  if enabled vaapi; then
-    check_pkg libva ">=0.38.0"     || \
-      die "vaapi (Video Acceleration (VA) API for Linux) not found"
-    check_pkg libva-x11 ">=0.38.0" || die "libva-x11 not found"
-    check_pkg libva-drm ">=0.38.0" || die "libva-drm not found"
+  # nvenc
+  # latest ffmpeg has own code
+  if enabled_or_auto nvenc; then
+    #check_cc_header nvEncodeAPI || \
+    #  die "NVENC library (https://developer.nvidia.com/nvidia-video-codec-sdk) not found"
+    enable nvenc
+  else
+    disable nvenc
+  fi
+
+  # omx
+  if enabled omx; then
+    OLDCFLAGS=$CFLAGS
+    if [ -d "/opt/vc/include" ]; then
+      CFLAGS="-I/opt/vc/include $CFLAGS"
+    fi
+    check_cc_header "bcm_host" omx_rpi
+    if enabled omx_rpi; then
+      CFLAGS="-I/opt/vc/include/IL $OLDCFLAGS"
+      enable mmal
+    else
+      CFLAGS=$OLDCFLAGS
+    fi
+    check_cc_header OMX_Core omx || die "OpenMAX IL not found"
   fi
 
 else
 
   if enabled_or_auto libav; then
     has_libav=true
+    has_resample=false
 
-    check_pkg libavfilter   ">=6.31.100"  || has_libav=false
-    check_pkg libswresample ">=2.0.101"   || has_libav=false
-    check_pkg libavresample ">=3.0.0"     || has_libav=false
-    check_pkg libswscale    ">=4.0.100"   || has_libav=false
-    check_pkg libavformat   ">=57.25.100" || has_libav=false
-    check_pkg libavcodec    ">=57.24.102" || has_libav=false
-    check_pkg libavutil     ">=55.17.103" || has_libav=false
+    check_pkg libavfilter   ">=6.47.100"  || has_libav=false
+    check_pkg libswresample ">=2.1.100"   && has_resample=true
+    check_pkg libavresample ">=3.0.0"     && has_resample=true
+    check_pkg libswscale    ">=4.1.100"   || has_libav=false
+    check_pkg libavformat   ">=57.41.100" || has_libav=false
+    check_pkg libavcodec    ">=57.48.101" || has_libav=false
+    check_pkg libavutil     ">=55.28.100" || has_libav=false
 
-    if $has_libav; then
+    if $has_libav -a $has_resample; then
       enable libav
     else
       echo "WARNING: none or old ffmpeg libraries were detected"
@@ -545,6 +638,22 @@ else
 
   fi
 
+fi
+
+#
+# vaapi
+#
+if enabled_or_auto vaapi; then
+  if enabled libav; then
+    if check_pkg libva ">=0.38.0"; then
+      check_pkg libva-x11 ">=0.38.0" || die "libva-x11 not found"
+      check_pkg libva-drm ">=0.38.0" || die "libva-drm not found"
+      enable vaapi
+      enable hwaccels
+    elif enabled vaapi; then
+      die "vaapi (Video Acceleration (VA) API for Linux) not found"
+    fi
+  fi
 fi
 
 #
@@ -567,31 +676,28 @@ if enabled_or_auto inotify; then
 fi
 
 #
+# common card client
+#
+if enabled cwc || enabled cccam; then
+  enable cardclient
+fi
+
+#
 # libdvbcsa, tvhcsa
 #
-if enabled cwc || enabled capmt || enabled constcw; then
-  enable tvhcsa
-  if enabled dvbcsa; then
-    (check_cc_header "dvbcsa/dvbcsa" dvbcsa_h &&\
-     check_cc_lib    dvbcsa dvbcsa_l) ||\
-    die "Failed to find dvbcsa support (use --disable-dvbcsa)"
-    LDFLAGS="$LDFLAGS -ldvbcsa"
+if enabled_or_auto tvhcsa; then
+  if enabled cwc || enabled cccam || enabled capmt || enabled constcw; then
+    enable tvhcsa
+    enable dvbcsa
+    if enabled dvbcsa; then
+      (check_cc_header "dvbcsa/dvbcsa" dvbcsa_h &&\
+       check_cc_lib    dvbcsa dvbcsa_l) ||\
+      die "Failed to find dvbcsa library"
+      LDFLAGS="$LDFLAGS -ldvbcsa"
+    fi
+  else
+    disable tvhcsa
   fi
-fi
-
-#
-# libdvben50221
-#
-if enabled libdvben50221; then
-  LDFLAGS="$LDFLAGS -ldvben50221 -ldvbapi -lucsi"
-  enable linuxdvb_ca
-fi
-
-#
-# Icon caching
-#
-if enabled_or_auto imagecache; then
-  enable imagecache
 fi
 
 #
@@ -656,17 +762,10 @@ if enabled_or_auto dbus_1; then
 fi
 
 #
-# TSDebug
-#
-if enabled_or_auto tsdebug; then
-  enable mpegts_dvb
-fi
-
-#
 # systemd
 #
 if enabled_or_auto libsystemd_daemon; then
-  if check_pkg libsystemd-daemon; then
+  if check_pkg libsystemd-daemon || check_pkg libsystemd; then
     enable libsystemd_daemon
   elif enabled libsystemd_daemon; then
     die "libsystemd-daemon development support not found (use --disable-systemd_daemon)"

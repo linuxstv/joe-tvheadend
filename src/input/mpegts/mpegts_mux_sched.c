@@ -73,7 +73,8 @@ mpegts_mux_sched_class_save ( idnode_t *in, char *filename, size_t fsize )
   htsmsg_t *c = htsmsg_create_map();
   char ubuf[UUID_HEX_SIZE];
   idnode_save(in, c);
-  snprintf(filename, fsize, "muxsched/%s", idnode_uuid_as_str(in, ubuf));
+  if (filename)
+    snprintf(filename, fsize, "muxsched/%s", idnode_uuid_as_str(in, ubuf));
   return c;
 }
 
@@ -124,7 +125,7 @@ PROP_DOC(cron)
 const idclass_t mpegts_mux_sched_class =
 {
   .ic_class      = "mpegts_mux_sched",
-  .ic_caption    = N_("Mux Scheduler"),
+  .ic_caption    = N_("DVB Inputs - Mux Schedulers"),
   .ic_event      = "mpegts_mux_sched",
   .ic_doc        = tvh_doc_mpegts_mux_sched_class,
   .ic_changed    = mpegts_mux_sched_class_changed,
@@ -366,7 +367,7 @@ mpegts_mux_sched_init ( void )
   if ((c = hts_settings_load_r(1, "muxsched"))) {
     HTSMSG_FOREACH(f, c) {
       if (!(e = htsmsg_field_get_map(f))) continue;
-      mpegts_mux_sched_create(f->hmf_name, e);
+      mpegts_mux_sched_create(htsmsg_field_name(f), e);
     }
     htsmsg_destroy(c);
   }
@@ -376,10 +377,10 @@ void
 mpegts_mux_sched_done ( void )
 {
   mpegts_mux_sched_t *mms;
-  pthread_mutex_lock(&global_lock);
+  tvh_mutex_lock(&global_lock);
   while ((mms = LIST_FIRST(&mpegts_mux_sched_all)))
     mpegts_mux_sched_delete(mms, 0);
-  pthread_mutex_unlock(&global_lock);
+  tvh_mutex_unlock(&global_lock);
 }
 
 /******************************************************************************

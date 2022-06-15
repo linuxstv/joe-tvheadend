@@ -24,21 +24,11 @@
 #include "htsbuf.h"
 #include "url.h"
 #include "udp.h"
+#include "tvhpoll.h"
 
 #define IPTV_BUF_SIZE    (300*188)
 #define IPTV_PKTS        32
 #define IPTV_PKT_PAYLOAD 1472
-
-#define IPTV_KILL_KILL   0
-#define IPTV_KILL_TERM   1
-#define IPTV_KILL_INT    2
-#define IPTV_KILL_HUP    3
-#define IPTV_KILL_USR1   4
-#define IPTV_KILL_USR2   5
-
-struct bouquet;
-
-extern pthread_mutex_t iptv_lock;
 
 typedef struct iptv_input   iptv_input_t;
 typedef struct iptv_network iptv_network_t;
@@ -52,10 +42,10 @@ struct iptv_handler
 
   uint32_t buffer_limit;
 
-  int     (*start) ( iptv_mux_t *im, const char *raw, const url_t *url );
-  void    (*stop)  ( iptv_mux_t *im );
-  ssize_t (*read)  ( iptv_mux_t *im );
-  void    (*pause) ( iptv_mux_t *im, int pause );
+  int     (*start) ( iptv_input_t *mi, iptv_mux_t *im, const char *raw, const url_t *url );
+  void    (*stop)  ( iptv_input_t *mi, iptv_mux_t *im );
+  ssize_t (*read)  ( iptv_input_t *mi, iptv_mux_t *im );
+  void    (*pause) ( iptv_input_t *mi, iptv_mux_t *im, int pause );
   
   RB_ENTRY(iptv_handler) link;
 };
@@ -65,13 +55,16 @@ void iptv_handler_register ( iptv_handler_t *ih, int num );
 struct iptv_input
 {
   mpegts_input_t;
+
+  void *mi_tpool;
 };
 
-int  iptv_input_fd_started ( iptv_mux_t *im );
-void iptv_input_mux_started ( iptv_mux_t *im );
+int  iptv_input_fd_started ( iptv_input_t *mi, iptv_mux_t *im );
+void iptv_input_close_fds ( iptv_input_t *mi, iptv_mux_t *im );
+void iptv_input_mux_started ( iptv_input_t *mi, iptv_mux_t *im, int reset );
 int  iptv_input_recv_packets ( iptv_mux_t *im, ssize_t len );
 void iptv_input_recv_flush ( iptv_mux_t *im );
-void iptv_input_pause_handler ( iptv_mux_t *im, int pause );
+void iptv_input_pause_handler ( iptv_input_t *mi, iptv_mux_t *im, int pause );
 
 struct iptv_network
 {
@@ -93,8 +86,6 @@ struct iptv_network
 
   char    *in_url;
   char    *in_url_sane;
-  int      in_bouquet;
-  mtimer_t in_bouquet_timer;
   char    *in_ctx_charset;
   int64_t  in_channel_number;
   uint32_t in_refetch_period;
@@ -102,7 +93,11 @@ struct iptv_network
   char    *in_icon_url_sane;
   int      in_ssl_peer_verify;
   char    *in_remove_args;
+  char    *in_ignore_args;
+  int      in_ignore_path;
   int      in_tsid_accept_zero_value;
+  int      in_libav;
+  int64_t  in_bandwidth_clock;
 
   void    *in_auto; /* private structure for auto-network */
 };
@@ -122,9 +117,11 @@ struct iptv_mux
   char                 *mm_iptv_url;
   char                 *mm_iptv_url_sane;
   char                 *mm_iptv_url_raw;
+  char                 *mm_iptv_url_cmpid;
   char                 *mm_iptv_interface;
 
   int                   mm_iptv_substitute;
+  int                   mm_iptv_libav;
   int                   mm_iptv_atsc;
 
   char                 *mm_iptv_muxname;
@@ -141,6 +138,8 @@ struct iptv_mux
   char                 *mm_iptv_hdr;
   char                 *mm_iptv_tags;
   uint32_t              mm_iptv_satip_dvbt_freq;
+  uint32_t              mm_iptv_satip_dvbc_freq;
+  uint32_t              mm_iptv_satip_dvbs_freq;
 
   uint32_t              mm_iptv_rtp_seq;
 
@@ -159,6 +158,8 @@ struct iptv_mux
   void                 *im_data;
 
   int                   im_delete_flag;
+
+  void                 *im_opaque;
 };
 
 iptv_mux_t* iptv_mux_create0
@@ -178,11 +179,10 @@ extern const idclass_t iptv_network_class;
 extern const idclass_t iptv_auto_network_class;
 extern const idclass_t iptv_mux_class;
 
-extern iptv_input_t   *iptv_input;
 extern iptv_network_t *iptv_network;
 
+extern tvh_mutex_t iptv_lock;
 
-void iptv_bouquet_trigger(iptv_network_t *in, int timeout);
 int iptv_url_set ( char **url, char **sane_url, const char *str, int allow_file, int allow_pipe );
 
 void iptv_mux_load_all ( void );
@@ -196,6 +196,7 @@ void iptv_udp_init     ( void );
 void iptv_rtsp_init    ( void );
 void iptv_pipe_init    ( void );
 void iptv_file_init    ( void );
+void iptv_libav_init   ( void );
 
 ssize_t iptv_rtp_read ( iptv_mux_t *im, udp_multirecv_t *um,
                         void (*pkt_cb)(iptv_mux_t *im, uint8_t *buf, int len) );

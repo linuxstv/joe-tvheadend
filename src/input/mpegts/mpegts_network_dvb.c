@@ -47,7 +47,7 @@ dvb_network_class_delete ( idnode_t *in )
   char ubuf[UUID_HEX_SIZE];
 
   /* remove config */
-  hts_settings_remove("input/dvb/networks/%s", 
+  hts_settings_remove("input/dvb/networks/%s",
                       idnode_uuid_as_str(in, ubuf));
 
   /* Parent delete */
@@ -57,8 +57,8 @@ dvb_network_class_delete ( idnode_t *in )
 static const void *
 dvb_network_class_scanfile_get ( void *o )
 {
-  static const char *s = NULL;
-  return &s;
+  prop_ptr = NULL;
+  return &prop_ptr;
 }
 
 void
@@ -83,8 +83,10 @@ dvb_network_scanfile_set ( dvb_network_t *ln, const char *id )
     if (!(mm = dvb_network_find_mux(ln, dmc, MPEGTS_ONID_NONE, MPEGTS_TSID_NONE, 0, 0))) {
       mm = dvb_mux_create0(ln, MPEGTS_ONID_NONE, MPEGTS_TSID_NONE,
                            dmc, NULL, NULL);
-      if (mm)
+      if (mm) {
+        mpegts_mux_post_create((mpegts_mux_t *)mm);
         idnode_changed(&mm->mm_id);
+      }
       if (tvhtrace_enabled()) {
         char buf[128];
         dvb_mux_conf_str(dmc, buf, sizeof(buf));
@@ -140,6 +142,8 @@ dvb_network_class_scanfile_list0
     type = "isdb-c";
   else if (clazz == &dvb_network_isdb_s_class)
     type = "isdb-s";
+  else if (clazz == &dvb_network_dtmb_class)
+    type = "dtmb";
   else if (clazz == &dvb_network_dab_class)
     type = "dab";
   else
@@ -174,21 +178,17 @@ SCANFILE_LIST(atsc_c);
 SCANFILE_LIST(isdb_t);
 SCANFILE_LIST(isdb_c);
 SCANFILE_LIST(isdb_s);
+SCANFILE_LIST(dtmb);
 SCANFILE_LIST(dab);
 
 static const void *
 dvb_network_class_orbital_pos_get ( void *o )
 {
   dvb_network_t *ln = o;
-  static char buf[16];
-  static const char *s;
-  s = NULL;
-  if (ln->mn_satpos != INT_MAX) {
-    dvb_sat_position_to_str(ln->mn_satpos, buf, sizeof(buf));
-    s = buf;
-  } else
-    s = "";
-  return &s;
+  prop_sbuf[0] = '\0';
+  if (ln->mn_satpos != INT_MAX)
+    dvb_sat_position_to_str(ln->mn_satpos, prop_sbuf, PROP_SBUF_LEN);
+  return &prop_sbuf_ptr;
 }
 
 static int
@@ -360,6 +360,16 @@ const idclass_t dvb_network_atsc_c_class =
   }
 };
 
+const idclass_t dvb_network_cablecard_class =
+{
+  .ic_super      = &dvb_network_class,
+  .ic_class      = "dvb_network_cablecard",
+  .ic_caption    = N_("CableCARD Network"),
+  .ic_properties = (const property_t[]){
+    {}
+  }
+};
+
 const idclass_t dvb_network_isdb_t_class =
 {
   .ic_super      = &dvb_network_class,
@@ -429,6 +439,29 @@ const idclass_t dvb_network_isdb_s_class =
   }
 };
 
+const idclass_t dvb_network_dtmb_class =
+{
+  .ic_super      = &dvb_network_class,
+  .ic_class      = "dvb_network_dtmb",
+  .ic_caption    = N_("DTMB Network"),
+  .ic_properties = (const property_t[]) {
+    {
+      .type     = PT_STR,
+      .id       = "scanfile",
+      .name     = N_("Pre-defined muxes"),
+      .desc     = N_("Use a pre-defined list of DTMB muxes. "
+                     "Note: these lists can sometimes be outdated and "
+                     "may cause scanning to take longer than usual."),
+      .doc      = prop_doc_predefinedmuxlist,
+      .set      = dvb_network_class_scanfile_set,
+      .get      = dvb_network_class_scanfile_get,
+      .list     = dvb_network_class_scanfile_list_dtmb,
+      .opts     = PO_NOSAVE,
+    },
+    {}
+  }
+};
+
 const idclass_t dvb_network_dab_class =
 {
   .ic_super      = &dvb_network_class,
@@ -470,6 +503,7 @@ dvb_network_check_symbol_rate( dvb_mux_t *lm, dvb_mux_conf_t *dmc, int deltar )
 {
   switch (dmc->dmc_fe_type) {
   case DVB_TYPE_T:
+  case DVB_TYPE_DTMB:
     return dvb_network_check_bandwidth(lm->lm_tuning.u.dmc_fe_ofdm.bandwidth,
                                        dmc->u.dmc_fe_ofdm.bandwidth);
   case DVB_TYPE_C:
@@ -499,7 +533,7 @@ dvb_network_check_orbital_pos ( int satpos1, int satpos2 )
 
 dvb_mux_t *
 dvb_network_find_mux
-  ( dvb_network_t *ln, dvb_mux_conf_t *dmc, uint16_t onid, uint16_t tsid, int check, int approx_match )
+  ( dvb_network_t *ln, dvb_mux_conf_t *dmc, uint32_t onid, uint32_t tsid, int check, int approx_match )
 {
   int deltaf, deltar;
   mpegts_mux_t *mm, *mm_alt = NULL;
@@ -586,8 +620,9 @@ dvb_network_config_save ( mpegts_network_t *mn, char *filename, size_t fsize )
   char ubuf[UUID_HEX_SIZE];
   idnode_save(&mn->mn_id, c);
   htsmsg_add_str(c, "class", mn->mn_id.in_class->ic_class);
-  snprintf(filename, fsize, "input/dvb/networks/%s/config",
-           idnode_uuid_as_str(&mn->mn_id, ubuf));
+  if (filename)
+    snprintf(filename, fsize, "input/dvb/networks/%s/config",
+             idnode_uuid_as_str(&mn->mn_id, ubuf));
   return c;
 }
 
@@ -607,10 +642,14 @@ dvb_network_mux_class
     return &dvb_mux_atsc_c_class;
   if (idnode_is_instance(&mn->mn_id, &dvb_network_isdb_t_class))
     return &dvb_mux_isdb_t_class;
+  if (idnode_is_instance(&mn->mn_id, &dvb_network_cablecard_class))
+    return &dvb_mux_cablecard_class;
   if (idnode_is_instance(&mn->mn_id, &dvb_network_isdb_c_class))
     return &dvb_mux_isdb_c_class;
   if (idnode_is_instance(&mn->mn_id, &dvb_network_isdb_s_class))
     return &dvb_mux_isdb_s_class;
+  if (idnode_is_instance(&mn->mn_id, &dvb_network_dtmb_class))
+    return &dvb_mux_dtmb_class;
   if (idnode_is_instance(&mn->mn_id, &dvb_network_dab_class))
     return &dvb_mux_dab_class;
   return NULL;
@@ -637,7 +676,7 @@ dvb_network_mux_class
 
 static mpegts_mux_t *
 dvb_network_create_mux
-  ( mpegts_network_t *mn, void *origin, uint16_t onid, uint16_t tsid,
+  ( mpegts_network_t *mn, void *origin, uint32_t onid, uint32_t tsid,
     void *p, int force )
 {
   int save = 0, satpos;
@@ -666,12 +705,7 @@ dvb_network_create_mux
   ln = (dvb_network_t*)mn;
   mm = dvb_network_find_mux(ln, dmc, onid, tsid, 0, 0);
   if (!mm && (ln->mn_autodiscovery != MN_DISCOVERY_DISABLE || force)) {
-    cls = dvb_network_mux_class((mpegts_network_t *)ln);
-    save |= cls == &dvb_mux_dvbt_class && dmc->dmc_fe_type == DVB_TYPE_T;
-    save |= cls == &dvb_mux_dvbc_class && dmc->dmc_fe_type == DVB_TYPE_C;
-    save |= cls == &dvb_mux_dvbs_class && dmc->dmc_fe_type == DVB_TYPE_S;
-    save |= cls == &dvb_mux_atsc_t_class && dmc->dmc_fe_type == DVB_TYPE_ATSC_T;
-    save |= cls == &dvb_mux_atsc_c_class && dmc->dmc_fe_type == DVB_TYPE_ATSC_C;
+    save |= dvb_fe_type_by_network_class(ln->mn_id.in_class) == dmc->dmc_fe_type;
     if (save && dmc->dmc_fe_type == DVB_TYPE_S) {
       satpos = dvb_network_get_orbital_pos(mn);
       /* do not allow to mix satellite positions */
@@ -680,6 +714,7 @@ dvb_network_create_mux
     }
     if (save) {
       mm = dvb_mux_create0(ln, onid, tsid, dmc, NULL, NULL);
+      mpegts_mux_post_create((mpegts_mux_t *)mm);
       if (tvhtrace_enabled()) {
         char buf[128];
         dvb_mux_conf_str(&((dvb_mux_t *)mm)->lm_tuning, buf, sizeof(buf));
@@ -741,6 +776,7 @@ dvb_network_create_mux
     save |= COMPAREN(dmc_fe_pilot, CBIT_PILOT);
     switch (dmc->dmc_fe_type) {
     case DVB_TYPE_T:
+    case DVB_TYPE_DTMB:
       save |= COMPARE(dmc_fe_stream_id, CBIT_STREAM_ID);
       save |= COMPAREN(u.dmc_fe_ofdm.bandwidth, CBIT_BANDWIDTH);
       save |= COMPAREN(u.dmc_fe_ofdm.hierarchy_information, CBIT_HIERARCHY);
@@ -758,8 +794,11 @@ dvb_network_create_mux
       save |= COMPAREN(u.dmc_fe_qpsk.fec_inner, CBIT_FEC_INNER);
       break;
     case DVB_TYPE_C:
+    case DVB_TYPE_ATSC_C:
       save |= COMPARE(u.dmc_fe_qam.symbol_rate, CBIT_RATE);
       save |= COMPAREN(u.dmc_fe_qam.fec_inner, CBIT_FEC_INNER);
+      break;
+    case DVB_TYPE_ATSC_T:
       break;
     default:
       abort();
@@ -797,7 +836,25 @@ static mpegts_service_t *
 dvb_network_create_service
   ( mpegts_mux_t *mm, uint16_t sid, uint16_t pmt_pid )
 {
-  return mpegts_service_create1(NULL, mm, sid, pmt_pid, NULL);
+  dvb_mux_t *lm = (dvb_mux_t *)mm;
+  mpegts_service_t *s;
+
+  s = mpegts_service_create1(NULL, mm, sid, pmt_pid, NULL);
+
+  /* Set service values from mux if CableCARD */
+  if (lm->lm_tuning.dmc_fe_type == DVB_TYPE_CABLECARD) {
+    mpegts_network_t *ln = mm->mm_network;
+    if (!s->s_dvb_provider && lm->mm_provider_network_name)
+      s->s_dvb_provider = strdup(lm->mm_provider_network_name);
+    if (!s->s_dvb_provider && ln->mn_provider_network_name)
+      s->s_dvb_provider = strdup(ln->mn_provider_network_name);
+    if (!s->s_dvb_channel_num)
+      s->s_dvb_channel_num = lm->lm_tuning.u.dmc_fe_cablecard.vchannel;
+    if (!s->s_dvb_svcname && lm->lm_tuning.u.dmc_fe_cablecard.name)
+      s->s_dvb_svcname = strdup(lm->lm_tuning.u.dmc_fe_cablecard.name);
+  }
+
+  return s;
 }
 
 static mpegts_mux_t *
@@ -805,9 +862,10 @@ dvb_network_mux_create2
   ( mpegts_network_t *mn, htsmsg_t *conf )
 {
   dvb_network_t *ln = (dvb_network_t*)mn;
-  return (mpegts_mux_t*)
-    dvb_mux_create0(ln, MPEGTS_ONID_NONE, MPEGTS_TSID_NONE,
-                    NULL, NULL, conf);
+  dvb_mux_t *mm;
+  mm = dvb_mux_create0(ln, MPEGTS_ONID_NONE, MPEGTS_TSID_NONE,
+                       NULL, NULL, conf);
+  return mpegts_mux_post_create((mpegts_mux_t *)mm);
 }
 
 /* ****************************************************************************
@@ -819,6 +877,7 @@ dvb_network_create0
   ( const char *uuid, const idclass_t *idc, htsmsg_t *conf )
 {
   dvb_network_t *ln;
+  dvb_mux_t *lm;
   htsmsg_t *c, *e;
   htsmsg_field_t *f;
   const char *s;
@@ -831,7 +890,7 @@ dvb_network_create0
   if (!(ln = (dvb_network_t*)mpegts_network_create0((void*)ln,
                                      idc, uuid, NULL, conf)))
     return NULL;
-  
+
   /* Callbacks */
   ln->mn_create_mux     = dvb_network_create_mux;
   ln->mn_create_service = dvb_network_create_service;
@@ -853,7 +912,8 @@ dvb_network_create0
     HTSMSG_FOREACH(f, c) {
       if (!(e = htsmsg_get_map_by_field(f)))  continue;
       if (!(e = htsmsg_get_map(e, "config"))) continue;
-      (void)dvb_mux_create1(ln, f->hmf_name, e);
+      lm = dvb_mux_create1(ln, htsmsg_field_name(f), e);
+      mpegts_mux_post_create((mpegts_mux_t *)lm);
     }
     htsmsg_destroy(c);
   }
@@ -874,6 +934,7 @@ static const idclass_t * dvb_network_classes[] = {
   &dvb_network_dvbs_class,
   &dvb_network_atsc_t_class,
   &dvb_network_atsc_c_class,
+  &dvb_network_cablecard_class,
   &dvb_network_isdb_t_class,
   &dvb_network_isdb_c_class,
   &dvb_network_isdb_s_class,
@@ -888,6 +949,7 @@ static const idclass_t * dvb_mux_classes[] = {
   &dvb_mux_dvbs_class,
   &dvb_mux_atsc_t_class,
   &dvb_mux_atsc_c_class,
+  &dvb_mux_cablecard_class,
   &dvb_mux_isdb_t_class,
   &dvb_mux_isdb_c_class,
   &dvb_mux_isdb_s_class,
@@ -914,7 +976,7 @@ void dvb_network_init ( void )
   for (i = 0; i < ARRAY_SIZE(dvb_network_classes); i++)
     mpegts_network_register_builder(dvb_network_classes[i],
                                     dvb_network_builder);
-  
+
   /* Load settings */
   if (!(c = hts_settings_load_r(1, "input/dvb/networks")))
     return;
@@ -927,7 +989,7 @@ void dvb_network_init ( void )
       if (strcmp(s, "dvb_network_atsc") == 0)
         s = "dvb_network_atsc_t";
       if(!strcmp(dvb_network_classes[i]->ic_class, s)) {
-        dvb_network_create0(f->hmf_name, dvb_network_classes[i], e);
+        dvb_network_create0(htsmsg_field_name(f), dvb_network_classes[i], e);
         break;
       }
     }
@@ -939,13 +1001,13 @@ void dvb_network_done ( void )
 {
   int i;
 
-  pthread_mutex_lock(&global_lock);
+  tvh_mutex_lock(&global_lock);
   /* Unregister class builders */
   for (i = 0; i < ARRAY_SIZE(dvb_network_classes); i++) {
     mpegts_network_unregister_builder(dvb_network_classes[i]);
     mpegts_network_class_delete(dvb_network_classes[i], 0);
   }
-  pthread_mutex_unlock(&global_lock);
+  tvh_mutex_unlock(&global_lock);
 
   dvb_charset_done();
   scanfile_done();
@@ -967,12 +1029,16 @@ const idclass_t *dvb_network_class_by_fe_type(dvb_fe_type_t type)
     return &dvb_network_atsc_t_class;
   else if (type == DVB_TYPE_ATSC_C)
     return &dvb_network_atsc_c_class;
+  else if (type == DVB_TYPE_CABLECARD)
+    return &dvb_network_cablecard_class;
   else if (type == DVB_TYPE_ISDB_T)
     return &dvb_network_isdb_t_class;
   else if (type == DVB_TYPE_ISDB_C)
     return &dvb_network_isdb_c_class;
   else if (type == DVB_TYPE_ISDB_S)
     return &dvb_network_isdb_s_class;
+  else if (type == DVB_TYPE_DTMB)
+    return &dvb_network_dtmb_class;
   else if (type == DVB_TYPE_DAB)
     return &dvb_network_dab_class;
 
@@ -991,12 +1057,16 @@ dvb_fe_type_t dvb_fe_type_by_network_class(const idclass_t *idc)
     return DVB_TYPE_ATSC_T;
   else if (idc == &dvb_network_atsc_c_class)
     return DVB_TYPE_ATSC_C;
+  else if (idc == &dvb_network_cablecard_class)
+    return DVB_TYPE_CABLECARD;
   else if (idc == &dvb_network_isdb_t_class)
     return DVB_TYPE_ISDB_T;
   else if (idc == &dvb_network_isdb_c_class)
     return DVB_TYPE_ISDB_C;
   else if (idc == &dvb_network_isdb_s_class)
     return DVB_TYPE_ISDB_S;
+  else if (idc == &dvb_network_dtmb_class)
+    return DVB_TYPE_DTMB;
   else if (idc == &dvb_network_dab_class)
     return DVB_TYPE_DAB;
 

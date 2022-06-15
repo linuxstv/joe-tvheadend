@@ -17,6 +17,8 @@
  *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "libhdhomerun/hdhomerun.h"
+
 #include "tvheadend.h"
 #include "input.h"
 #include "htsbuf.h"
@@ -28,7 +30,10 @@
 #include <arpa/inet.h>
 #include <openssl/sha.h>
 
-#ifdef HDHOMERUN_TAG_DEVICE_AUTH_BIN
+#include "config.h"
+
+#if defined(HDHOMERUN_TAG_DEVICE_AUTH_BIN) \
+           || defined(HDHOMERUN_TAG_DEVICE_AUTH_BIN_DEPRECATED)
 #define hdhomerun_discover_find_devices_custom \
            hdhomerun_discover_find_devices_custom_v2
 #endif
@@ -44,15 +49,17 @@ tvhdhomerun_device_class_save ( idnode_t *in, char *filename, size_t fsize )
   m = htsmsg_create_map();
   idnode_save(&hd->th_id, m);
 
-  l = htsmsg_create_map();
-  TAILQ_FOREACH(lfe, &hd->hd_frontends, hf_link)
-    tvhdhomerun_frontend_save(lfe, l);
-  htsmsg_add_msg(m, "frontends", l);
+  if (filename) {
+    l = htsmsg_create_map();
+    TAILQ_FOREACH(lfe, &hd->hd_frontends, hf_link)
+      tvhdhomerun_frontend_save(lfe, l);
+    htsmsg_add_msg(m, "frontends", l);
+
+    snprintf(filename, fsize, "input/tvhdhomerun/adapters/%s",
+             idnode_uuid_as_str(&hd->th_id, ubuf));
+  }
 
   htsmsg_add_str(m, "fe_override", hd->hd_override_type);
-
-  snprintf(filename, fsize, "input/tvhdhomerun/adapters/%s",
-           idnode_uuid_as_str(&hd->th_id, ubuf));
   return m;
 }
 
@@ -78,18 +85,33 @@ static int tvhdhomerun_discoveries_count;
 static struct tvhdhomerun_discovery_queue tvhdhomerun_discoveries;
 
 static pthread_t tvhdhomerun_discovery_tid;
-static pthread_mutex_t tvhdhomerun_discovery_lock;
+static tvh_mutex_t tvhdhomerun_discovery_lock;
 static tvh_cond_t tvhdhomerun_discovery_cond;
 
-static const char *
-tvhdhomerun_device_class_get_title( idnode_t *in, const char *lang )
+static void
+tvhdhomerun_device_class_get_title
+  ( idnode_t *in, const char *lang, char *dst, size_t dstsize )
 {
   tvhdhomerun_device_t *hd = (tvhdhomerun_device_t *)in;
   char ip[64];
   tcp_get_str_from_ip(&hd->hd_info.ip_address, ip, sizeof(ip));
-  snprintf(prop_sbuf, PROP_SBUF_LEN,
+  snprintf(dst, dstsize,
            "%s - %s", hd->hd_info.friendlyname, ip);
-  return prop_sbuf;
+}
+
+static const void *
+tvhdhomerun_device_class_active_get ( void * obj )
+{
+  static int active;
+  tvhdhomerun_device_t *hd = (tvhdhomerun_device_t *)obj;
+  tvhdhomerun_frontend_t *lfe;
+  active = 0;
+  TAILQ_FOREACH(lfe, &hd->hd_frontends, hf_link)
+    if (*(int *)mpegts_input_class_active_get(lfe)) {
+      active = 1;
+      break;
+    }
+  return &active;
 }
 
 static htsmsg_t *
@@ -100,6 +122,7 @@ tvhdhomerun_device_class_override_enum( void * p, const char *lang )
   htsmsg_add_str(m, NULL, "DVB-C");
   htsmsg_add_str(m, NULL, "ATSC-T");
   htsmsg_add_str(m, NULL, "ATSC-C");
+  htsmsg_add_str(m, NULL, "CableCARD");
   return m;
 }
 
@@ -166,6 +189,13 @@ const idclass_t tvhdhomerun_device_class =
   .ic_get_childs = tvhdhomerun_device_class_get_childs,
   .ic_get_title  = tvhdhomerun_device_class_get_title,
   .ic_properties = (const property_t[]){
+    {
+      .type     = PT_BOOL,
+      .id       = "active",
+      .name     = N_("Active"),
+      .opts     = PO_RDONLY | PO_NOSAVE | PO_NOUI,
+      .get      = tvhdhomerun_device_class_active_get,
+    },
     {
       .type     = PT_STR,
       .id       = "networkType",
@@ -239,12 +269,12 @@ tvhdhomerun_device_calc_bin_uuid( uint8_t *uuid, const uint32_t device_id )
 }
 
 static void
-tvhdhomerun_device_calc_uuid( tvh_uuid_t *uuid, const uint32_t device_id )
+tvhdhomerun_device_calc_uuid( char *uhex, const uint32_t device_id )
 {
   uint8_t uuidbin[20];
 
   tvhdhomerun_device_calc_bin_uuid(uuidbin, device_id);
-  bin2hex(uuid->hex, sizeof(uuid->hex), uuidbin, sizeof(uuidbin));
+  bin2hex(uhex, UUID_HEX_SIZE, uuidbin, sizeof(uuidbin));
 }
 
 static tvhdhomerun_device_t *
@@ -269,12 +299,12 @@ static void tvhdhomerun_device_create(struct hdhomerun_discover_device_t *dInfo)
 
   tvhdhomerun_device_t *hd = calloc(1, sizeof(tvhdhomerun_device_t));
   htsmsg_t *conf = NULL, *feconf = NULL;
-  tvh_uuid_t uuid;
+  char uhex[UUID_HEX_SIZE];
   int j, save = 0;
   struct hdhomerun_device_t *hdhomerun_tuner;
   dvb_fe_type_t type = DVB_TYPE_C;
 
-  tvhdhomerun_device_calc_uuid(&uuid, dInfo->device_id);
+  tvhdhomerun_device_calc_uuid(uhex, dInfo->device_id);
 
   hdhomerun_tuner = hdhomerun_device_create(dInfo->device_id, dInfo->ip_addr, 0, NULL);
   {
@@ -285,7 +315,7 @@ static void tvhdhomerun_device_create(struct hdhomerun_discover_device_t *dInfo)
     hdhomerun_device_destroy(hdhomerun_tuner);
   }
 
-  conf = hts_settings_load("input/tvhdhomerun/adapters/%s", uuid.hex);
+  conf = hts_settings_load("input/tvhdhomerun/adapters/%s", uhex);
 
   if ( conf != NULL ) {
     const char *override_type = htsmsg_get_str(conf, "fe_override");
@@ -294,13 +324,18 @@ static void tvhdhomerun_device_create(struct hdhomerun_discover_device_t *dInfo)
         override_type = "ATSC-T";
       type = dvb_str2type(override_type);
       if ( ! ( type == DVB_TYPE_C || type == DVB_TYPE_T ||
-               type == DVB_TYPE_ATSC_T || type == DVB_TYPE_ATSC_C ) ) {
+               type == DVB_TYPE_ATSC_T || type == DVB_TYPE_ATSC_C ||
+               type == DVB_TYPE_CABLECARD ) ) {
         type = DVB_TYPE_C;
       }
     }
   } else {
     if (strstr(hd->hd_info.deviceModel, "_atsc"))
       type = DVB_TYPE_ATSC_T;
+    if (strstr(hd->hd_info.deviceModel, "_cablecard"))
+      type = DVB_TYPE_CABLECARD;
+    if (strstr(hd->hd_info.deviceModel, "_dvbt"))
+      type = DVB_TYPE_T;
   }
 
   hd->hd_override_type = strdup(dvb_type2str(type));
@@ -313,7 +348,7 @@ static void tvhdhomerun_device_create(struct hdhomerun_discover_device_t *dInfo)
   hd->hd_pids_deladd = 1;
 
   if (!tvh_hardware_create0((tvh_hardware_t*)hd, &tvhdhomerun_device_class,
-                            uuid.hex, conf))
+                            uhex, conf))
     return;
 
   TAILQ_INIT(&hd->hd_frontends);
@@ -328,7 +363,7 @@ static void tvhdhomerun_device_create(struct hdhomerun_discover_device_t *dInfo)
   memset(&hd->hd_info.ip_address, 0, sizeof(hd->hd_info.ip_address));
   hd->hd_info.ip_address.ss_family = AF_INET;
   ((struct sockaddr_in *)&hd->hd_info.ip_address)->sin_addr.s_addr = htonl(dInfo->ip_addr);
-  hd->hd_info.uuid = strdup(uuid.hex);
+  hd->hd_info.uuid = strdup(uhex);
   hd->hd_info.friendlyname = strdup(fName);
 
   if (conf)
@@ -350,6 +385,20 @@ static void tvhdhomerun_device_create(struct hdhomerun_discover_device_t *dInfo)
   htsmsg_destroy(conf);
 }
 
+static uint32_t
+tvhdhomerun_ip( void )
+{
+  if (*config.hdhomerun_ip == 0) return 0;
+
+  uint32_t ip = 0;
+  if (inet_pton(AF_INET, config.hdhomerun_ip, &ip))
+    ip = ntohl(ip);
+  else
+    tvherror(LS_TVHDHOMERUN, "Could not parse IP address %s", config.hdhomerun_ip);
+
+  return ip;
+}
+
 static void *
 tvhdhomerun_device_discovery_thread( void *aux )
 {
@@ -359,7 +408,7 @@ tvhdhomerun_device_discovery_thread( void *aux )
   while (tvheadend_is_running()) {
 
     numDevices =
-      hdhomerun_discover_find_devices_custom(0,
+      hdhomerun_discover_find_devices_custom(tvhdhomerun_ip(),
                                              HDHOMERUN_DEVICE_TYPE_TUNER,
                                              HDHOMERUN_DEVICE_ID_WILDCARD,
                                              result_list,
@@ -370,7 +419,7 @@ tvhdhomerun_device_discovery_thread( void *aux )
         numDevices--;
         struct hdhomerun_discover_device_t* cDev = &result_list[numDevices];
         if ( cDev->device_type == HDHOMERUN_DEVICE_TYPE_TUNER ) {
-          pthread_mutex_lock(&global_lock);
+          tvh_mutex_lock(&global_lock);
           tvhdhomerun_device_t *existing = tvhdhomerun_device_find(cDev->device_id);
           if ( tvheadend_is_running() ) {
             if ( !existing ) {
@@ -396,12 +445,12 @@ tvhdhomerun_device_discovery_thread( void *aux )
               tvhdhomerun_device_create(cDev);
             }
           }
-          pthread_mutex_unlock(&global_lock);
+          tvh_mutex_unlock(&global_lock);
         }
       }
     }
 
-    pthread_mutex_lock(&tvhdhomerun_discovery_lock);
+    tvh_mutex_lock(&tvhdhomerun_discovery_lock);
     brk = 0;
     if (tvheadend_is_running()) {
       brk = tvh_cond_timedwait(&tvhdhomerun_discovery_cond,
@@ -409,7 +458,7 @@ tvhdhomerun_device_discovery_thread( void *aux )
                                mclk() + sec2mono(15));
       brk = !ERRNO_AGAIN(brk) && brk != ETIMEDOUT;
     }
-    pthread_mutex_unlock(&tvhdhomerun_discovery_lock);
+    tvh_mutex_unlock(&tvhdhomerun_discovery_lock);
     if (brk)
       break;
   }
@@ -431,12 +480,13 @@ void tvhdhomerun_init ( void )
   idclass_register(&tvhdhomerun_frontend_dvbc_class);
   idclass_register(&tvhdhomerun_frontend_atsc_t_class);
   idclass_register(&tvhdhomerun_frontend_atsc_c_class);
+  idclass_register(&tvhdhomerun_frontend_cablecard_class);
   TAILQ_INIT(&tvhdhomerun_discoveries);
-  pthread_mutex_init(&tvhdhomerun_discovery_lock, NULL);
-  tvh_cond_init(&tvhdhomerun_discovery_cond);
-  tvhthread_create(&tvhdhomerun_discovery_tid, NULL,
-                   tvhdhomerun_device_discovery_thread,
-                   NULL, "hdhm-disc");
+  tvh_mutex_init(&tvhdhomerun_discovery_lock, NULL);
+  tvh_cond_init(&tvhdhomerun_discovery_cond, 1);
+  tvh_thread_create(&tvhdhomerun_discovery_tid, NULL,
+                    tvhdhomerun_device_discovery_thread,
+                    NULL, "hdhm-disc");
 }
 
 void tvhdhomerun_done ( void )
@@ -444,12 +494,12 @@ void tvhdhomerun_done ( void )
   tvh_hardware_t *th, *n;
   tvhdhomerun_discovery_t *d, *nd;
 
-  pthread_mutex_lock(&tvhdhomerun_discovery_lock);
+  tvh_mutex_lock(&tvhdhomerun_discovery_lock);
   tvh_cond_signal(&tvhdhomerun_discovery_cond, 0);
-  pthread_mutex_unlock(&tvhdhomerun_discovery_lock);
+  tvh_mutex_unlock(&tvhdhomerun_discovery_lock);
   pthread_join(tvhdhomerun_discovery_tid, NULL);
 
-  pthread_mutex_lock(&global_lock);
+  tvh_mutex_lock(&global_lock);
   for (th = LIST_FIRST(&tvh_hardware); th != NULL; th = n) {
     n = LIST_NEXT(th, th_link);
     if (idnode_is_instance(&th->th_id, &tvhdhomerun_device_class)) {
@@ -460,7 +510,7 @@ void tvhdhomerun_done ( void )
     nd = TAILQ_NEXT(d, disc_link);
     tvhdhomerun_discovery_destroy(d, 1);
   }
-  pthread_mutex_unlock(&global_lock);
+  tvh_mutex_unlock(&global_lock);
   hdhomerun_debug_destroy(hdhomerun_debug_obj);
 }
 

@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <inttypes.h>
 #include "queue.h"
+#include "uuid.h"
 #include "build.h"
 
 #define HTSMSG_ERR_FIELD_NOT_FOUND       -1
@@ -53,43 +54,44 @@ typedef struct htsmsg {
 #define HMF_LIST 5
 #define HMF_DBL  6
 #define HMF_BOOL 7
+#define HMF_UUID 8
 
 typedef struct htsmsg_field {
   TAILQ_ENTRY(htsmsg_field) hmf_link;
-  const char *hmf_name;
   uint8_t hmf_type;
   uint8_t hmf_flags;
 
 #define HMF_ALLOCED        0x1
 #define HMF_INALLOCED      0x2
-#define HMF_NAME_INALLOCED 0x4
-#define HMF_NAME_ALLOCED   0x8
+#define HMF_NONAME         0x4
 
   union {
     int64_t  s64;
     const char *str;
+    const uint8_t *uuid;
     struct {
       const char *data;
       size_t len;
     } bin;
-    htsmsg_t msg;
+    htsmsg_t *msg;
     double dbl;
-    int bool;
+    int boolean;
   } u;
 
 #if ENABLE_SLOW_MEMORYINFO
   size_t hmf_edata_size;
 #endif
-  char hmf_edata[0];
+  const char _hmf_name[0];
 } htsmsg_field_t;
 
 #define hmf_s64     u.s64
 #define hmf_msg     u.msg
 #define hmf_str     u.str
+#define hmf_uuid    u.uuid
 #define hmf_bin     u.bin.data
 #define hmf_binsize u.bin.len
 #define hmf_dbl     u.dbl
-#define hmf_bool    u.bool
+#define hmf_bool    u.boolean
 
 // backwards compat
 #define htsmsg_get_map_by_field(f) htsmsg_field_get_map(f)
@@ -98,6 +100,25 @@ typedef struct htsmsg_field {
 #define HTSMSG_FOREACH(f, msg) TAILQ_FOREACH(f, &(msg)->hm_fields, hmf_link)
 #define HTSMSG_FIRST(msg)      TAILQ_FIRST(&(msg)->hm_fields)
 #define HTSMSG_NEXT(f)         TAILQ_NEXT(f, hmf_link)
+
+/**
+ * Aligned memory allocation
+ */
+static inline size_t htsmsg_malloc_align(int type, size_t len)
+{
+  if (type == HMF_LIST || type == HMF_MAP)
+    return (len + (size_t)7) & ~(size_t)7;
+  return len;
+}
+
+/**
+ * Get a field name
+ */
+static inline const char *htsmsg_field_name(htsmsg_field_t *f)
+{
+  if (f->hmf_flags & HMF_NONAME) return "";
+  return f->_hmf_name;
+}
 
 /**
  * Create a new map
@@ -110,6 +131,11 @@ htsmsg_t *htsmsg_create_map(void);
 htsmsg_t *htsmsg_create_list(void);
 
 /**
+ * Concat msg2 to msg1 (list or map)
+ */
+void htsmsg_concat(htsmsg_t *msg1, htsmsg_t *msg2);
+
+/**
  * Remove a given field from a msg
  */
 void htsmsg_field_destroy(htsmsg_t *msg, htsmsg_field_t *f);
@@ -119,7 +145,15 @@ void htsmsg_field_destroy(htsmsg_t *msg, htsmsg_field_t *f);
  */
 void htsmsg_destroy(htsmsg_t *msg);
 
+/**
+ * Add an boolean field.
+ */
 void htsmsg_add_bool(htsmsg_t *msg, const char *name, int b);
+
+/**
+ * Add/update an boolean field.
+ */
+void htsmsg_set_bool(htsmsg_t *msg, const char *name, int b);
 
 /**
  * Add an integer field where source is signed 64 bit.
@@ -170,6 +204,11 @@ void htsmsg_add_str(htsmsg_t *msg, const char *name, const char *str);
 void htsmsg_add_str2(htsmsg_t *msg, const char *name, const char *str);
 
 /**
+ * Add a string field (allocated using malloc).
+ */
+void htsmsg_add_str_alloc(htsmsg_t *msg, const char *name, char *str);
+
+/**
  * Add a string field to a list only once.
  */
 void htsmsg_add_str_exclusive(htsmsg_t *msg, const char *str);
@@ -178,6 +217,7 @@ void htsmsg_add_str_exclusive(htsmsg_t *msg, const char *str);
  * Add/update a string field
  */
 int  htsmsg_set_str(htsmsg_t *msg, const char *name, const char *str);
+int  htsmsg_set_str2(htsmsg_t *msg, const char *name, const char *str);
 
 /**
  * Update a string field
@@ -209,18 +249,37 @@ void htsmsg_add_dbl(htsmsg_t *msg, const char *name, double dbl);
 void htsmsg_add_msg_extname(htsmsg_t *msg, const char *name, htsmsg_t *sub);
 
 /**
- * Add an binary field. The data is copied to a malloced storage
+ * Update an binary field
  */
-void htsmsg_add_bin(htsmsg_t *msg, const char *name, const void *bin,
-		    size_t len);
+int  htsmsg_field_set_bin(htsmsg_field_t *f, const void *bin, size_t len);
+int  htsmsg_field_set_bin_force(htsmsg_field_t *f, const void *bin, size_t len);
+
+/**
+ * Add an binary field. The data is copied to a inallocated storage.
+ */
+void htsmsg_add_bin(htsmsg_t *msg, const char *name, const void *bin, size_t len);
+
+/**
+ * Add an binary field. The passed data must be mallocated.
+ */
+void htsmsg_add_bin_alloc(htsmsg_t *msg, const char *name, const void *bin, size_t len);
 
 /**
  * Add an binary field. The data is not copied, instead the caller
  * is responsible for keeping the data valid for as long as the message
  * is around.
  */
-void htsmsg_add_binptr(htsmsg_t *msg, const char *name, const void *bin,
-		       size_t len);
+void htsmsg_add_bin_ptr(htsmsg_t *msg, const char *name, const void *bin, size_t len);
+
+/**
+ * Add/update a uuid field
+ */
+int htsmsg_set_uuid(htsmsg_t *msg, const char *name, tvh_uuid_t *u);
+
+/**
+ * Add an uuid field.
+ */
+void htsmsg_add_uuid(htsmsg_t *msg, const char *name, tvh_uuid_t *u);
 
 /**
  * Get an integer as an unsigned 32 bit integer.
@@ -241,6 +300,8 @@ int htsmsg_field_get_u32(htsmsg_field_t *f, uint32_t *u32p);
  *              out of range for the requested storage.
  */
 int htsmsg_get_s32(htsmsg_t *msg, const char *name,  int32_t *s32p);
+
+int htsmsg_field_get_s32(htsmsg_field_t *f, int32_t *s32p);
 
 /**
  * Get an integer as an signed 64 bit integer.
@@ -282,12 +343,22 @@ int htsmsg_get_bin(htsmsg_t *msg, const char *name, const void **binp,
 		   size_t *lenp);
 
 /**
+ * Get uuid struct from a uuid field.
+ *
+ * @param u Pointer to the tvh_uuid_t structure.
+ *
+ * @return HTSMSG_ERR_FIELD_NOT_FOUND - Field does not exist
+ *         HTSMSG_ERR_CONVERSION_IMPOSSIBLE - Field is not a binary blob.
+ */
+int htsmsg_get_uuid(htsmsg_t *msg, const char *name, tvh_uuid_t *u);
+
+/**
  * Get a field of type 'list'. No copying is done.
  *
  * @return NULL if the field can not be found or not of list type.
  *         Otherwise a htsmsg is returned.
  */
-htsmsg_t *htsmsg_get_list(htsmsg_t *msg, const char *name);
+htsmsg_t *htsmsg_get_list(const htsmsg_t *msg, const char *name);
 
 htsmsg_t *htsmsg_field_get_list(htsmsg_field_t *f);
 
@@ -340,9 +411,19 @@ const char *htsmsg_field_get_string(htsmsg_field_t *f);
 #define htsmsg_field_get_str(f) htsmsg_field_get_string(f)
 
 /**
- * Get s64 from field
+ * Given the field \p f, return a uuid if it is of type string, otherwise
+ * return NULL
  */
+int htsmsg_field_get_uuid(htsmsg_field_t *f, tvh_uuid_t *u);
 
+/**
+ * Get a field of type 'bin'.
+ *
+ * @return HTSMSG_ERR_FIELD_NOT_FOUND - Field does not exist
+ *         HTSMSG_ERR_CONVERSION_IMPOSSIBLE - Field is not an integer or
+ *              out of range for the requested storage.
+ */
+int htsmsg_field_get_bin(htsmsg_field_t *f, const void **binp, size_t *lenp);
 
 /**
  * Return the field \p name as an u32.
@@ -393,23 +474,28 @@ htsmsg_field_t *htsmsg_field_add(htsmsg_t *msg, const char *name,
 /**
  * Get a field, return NULL if it does not exist
  */
-htsmsg_field_t *htsmsg_field_find(htsmsg_t *msg, const char *name);
+htsmsg_field_t *htsmsg_field_find(const htsmsg_t *msg, const char *name);
 
 /**
  * Get a last field, return NULL if it does not exist
  */
 htsmsg_field_t *htsmsg_field_last(htsmsg_t *msg);
 
-
 /**
  * Clone a message.
  */
-htsmsg_t *htsmsg_copy(htsmsg_t *src);
+htsmsg_t *htsmsg_copy(const htsmsg_t *src);
+
+/**
+ * Copy only one field from one htsmsg to another (with renaming).
+ */
+void htsmsg_copy_field(htsmsg_t *dst, const char *dstname,
+                       const htsmsg_t *src, const char *srcname);
 
 /**
  * Compare a message.
  */
-int htsmsg_cmp(htsmsg_t *m1, htsmsg_t *m2);
+int htsmsg_cmp(const htsmsg_t *m1, const htsmsg_t *m2);
 
 #define HTSMSG_FOREACH(f, msg) TAILQ_FOREACH(f, &(msg)->hm_fields, hmf_link)
 
@@ -428,6 +514,10 @@ char *htsmsg_list_2_csv(htsmsg_t *m, char delim, int human);
 htsmsg_t *htsmsg_csv_2_list(const char *str, char delim);
 
 htsmsg_t *htsmsg_create_key_val(const char *key, const char *val);
+
+int htsmsg_is_string_in_list(htsmsg_t *list, const char *str);
+
+int htsmsg_remove_string_from_list(htsmsg_t *list, const char *str);
 
 /**
  *

@@ -129,7 +129,8 @@ timeshift_conf_class_save ( idnode_t *self, char *filename, size_t fsize )
 {
   htsmsg_t *m = htsmsg_create_map();
   idnode_save(&timeshift_conf.idnode, m);
-  snprintf(filename, fsize, "timeshift/config");
+  if (filename)
+    snprintf(filename, fsize, "timeshift/config");
   return m;
 }
 
@@ -198,9 +199,6 @@ const idclass_t timeshift_conf_class = {
       .type   = PT_BOOL,
       .id     = "ondemand",
       .name   = N_("On-demand (no first rewind)"),
-      /*.desc   = N_("Use timeshift only on-demand. It is started when the first request "
-                   "to move in the playback time occurs (fast-forward, rewind, goto)."),
-      */
       .desc   = N_("Only activate timeshift when the client makes the first "
                    "rewind, fast-forward or pause request. Note, "
                    "because there is no buffer on the first request "
@@ -253,7 +251,7 @@ const idclass_t timeshift_conf_class = {
       .id     = "ram_size",
       .name   = N_("Maximum RAM size (MB)"),
       .desc   = N_("The maximum RAM (system memory) size for timeshift "
-                   "buffers. When free RAM buffers are available, they "
+                   "buffers. When free RAM buffers are available they "
                    "are used for timeshift data in preference to using "
                    "storage."),
       .set    = timeshift_conf_class_ram_size_set,
@@ -276,7 +274,7 @@ const idclass_t timeshift_conf_class = {
       .name   = N_("RAM only"),
       .desc   = N_("Keep timeshift buffers in RAM only. "
                    "With this option enabled, the amount of rewind time "
-                   "is limited by how much RAM Tvheadend is allowed."),
+                   "is limited by how much RAM TVHeadend is allowed."),
       .off    = offsetof(timeshift_conf_t, ram_only),
       .opts   = PO_ADVANCED,
     },
@@ -419,12 +417,12 @@ timeshift_destroy(streaming_target_t *pad)
   /* Ensure the threads exits */
   // Note: this is a workaround for the fact the Q might have been flushed
   //       in reader thread (VERY unlikely)
-  pthread_mutex_lock(&ts->state_mutex);
+  tvh_mutex_lock(&ts->state_mutex);
   sm = streaming_msg_create(SMT_EXIT);
   streaming_target_deliver2(&ts->wr_queue.sq_st, sm);
   if (!ts->exit)
     timeshift_write_exit(ts->rd_pipe.wr);
-  pthread_mutex_unlock(&ts->state_mutex);
+  tvh_mutex_unlock(&ts->state_mutex);
 
   /* Wait for all threads */
   pthread_join(ts->rd_thread, NULL);
@@ -486,7 +484,7 @@ streaming_target_t *timeshift_create
   ts->seek.frame = NULL;
   ts->ram_segments = 0;
   ts->file_segments = 0;
-  pthread_mutex_init(&ts->state_mutex, NULL);
+  tvh_mutex_init(&ts->state_mutex, NULL);
 
   /* Initialise output */
   tvh_pipe(O_NONBLOCK, &ts->rd_pipe);
@@ -494,8 +492,8 @@ streaming_target_t *timeshift_create
   /* Initialise input */
   streaming_queue_init(&ts->wr_queue, 0, 0);
   streaming_target_init(&ts->input, &timeshift_input_ops, ts, 0);
-  tvhthread_create(&ts->wr_thread, NULL, timeshift_writer, ts, "tshift-wr");
-  tvhthread_create(&ts->rd_thread, NULL, timeshift_reader, ts, "tshift-rd");
+  tvh_thread_create(&ts->wr_thread, NULL, timeshift_writer, ts, "tshift-wr");
+  tvh_thread_create(&ts->rd_thread, NULL, timeshift_reader, ts, "tshift-rd");
 
   /* Update index */
   timeshift_index++;

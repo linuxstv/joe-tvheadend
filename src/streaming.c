@@ -69,12 +69,12 @@ streaming_message_data_size(streaming_message_t *sm)
 /**
  *
  */
-static void 
+static void
 streaming_queue_deliver(void *opauqe, streaming_message_t *sm)
 {
   streaming_queue_t *sq = opauqe;
 
-  pthread_mutex_lock(&sq->sq_mutex);
+  tvh_mutex_lock(&sq->sq_mutex);
 
   /* queue size protection */
   if (sq->sq_maxsize && sq->sq_maxsize < sq->sq_size) {
@@ -85,7 +85,7 @@ streaming_queue_deliver(void *opauqe, streaming_message_t *sm)
   }
 
   tvh_cond_signal(&sq->sq_cond, 0);
-  pthread_mutex_unlock(&sq->sq_mutex);
+  tvh_mutex_unlock(&sq->sq_mutex);
 }
 
 /**
@@ -95,8 +95,12 @@ static htsmsg_t *
 streaming_queue_info(void *opaque, htsmsg_t *list)
 {
   streaming_queue_t *sq = opaque;
+  size_t size;
   char buf[256];
-  snprintf(buf, sizeof(buf), "streaming queue %p size %zd", sq, sq->sq_size);
+  tvh_mutex_lock(&sq->sq_mutex);
+  size = sq->sq_size;
+  tvh_mutex_unlock(&sq->sq_mutex);
+  snprintf(buf, sizeof(buf), "streaming queue %p size %zd", sq, size);
   htsmsg_add_str(list, NULL, buf);
   return list;
 }
@@ -124,8 +128,8 @@ streaming_queue_init(streaming_queue_t *sq, int reject_filter, size_t maxsize)
 
   streaming_target_init(&sq->sq_st, &ops, sq, reject_filter);
 
-  pthread_mutex_init(&sq->sq_mutex, NULL);
-  tvh_cond_init(&sq->sq_cond);
+  tvh_mutex_init(&sq->sq_mutex, NULL);
+  tvh_cond_init(&sq->sq_cond, 1);
   TAILQ_INIT(&sq->sq_queue);
 
   sq->sq_maxsize = maxsize;
@@ -140,7 +144,7 @@ streaming_queue_deinit(streaming_queue_t *sq)
 {
   sq->sq_size = 0;
   streaming_queue_clear(&sq->sq_queue);
-  pthread_mutex_destroy(&sq->sq_mutex);
+  tvh_mutex_destroy(&sq->sq_mutex);
   tvh_cond_destroy(&sq->sq_cond);
 }
 
@@ -201,7 +205,7 @@ streaming_msg_create(streaming_message_type_t type)
   memoryinfo_alloc(&streaming_msg_memoryinfo, sizeof(*sm));
   sm->sm_type = type;
 #if ENABLE_TIMESHIFT
-  sm->sm_time      = 0;
+  sm->sm_time = 0;
 #endif
   return sm;
 }
@@ -423,6 +427,17 @@ streaming_pad_deliver(streaming_pad_t *sp, streaming_message_t *sm)
 /**
  *
  */
+void
+streaming_service_deliver(service_t *t, streaming_message_t *sm)
+{
+  if (atomic_set(&t->s_pending_restart, 0))
+    service_restart_streams(t);
+  streaming_pad_deliver(&t->s_streaming_pad, sm);
+}
+
+/**
+ *
+ */
 const char *
 streaming_code2txt(int code)
 {
@@ -431,7 +446,9 @@ streaming_code2txt(int code)
   switch(code) {
   case SM_CODE_OK:
     return N_("OK");
-    
+  case SM_CODE_FORCE_OK:
+    return N_("Forced OK");
+
   case SM_CODE_SOURCE_RECONFIGURED:
     return N_("Source reconfigured");
   case SM_CODE_BAD_SOURCE:
@@ -450,6 +467,8 @@ streaming_code2txt(int code)
     return N_("Weak stream");
   case SM_CODE_USER_REQUEST:
     return N_("User request");
+  case SM_CODE_PREVIOUSLY_RECORDED:
+    return N_("Previously recorded");
 
   case SM_CODE_NO_FREE_ADAPTER:
     return N_("No free adapter");
@@ -471,6 +490,12 @@ streaming_code2txt(int code)
     return N_("No assigned adapters");
   case SM_CODE_INVALID_SERVICE:
     return N_("Invalid service");
+  case SM_CODE_CHN_NOT_ENABLED:
+    return N_("No channel enabled");
+  case SM_CODE_DATA_TIMEOUT:
+    return N_("No A/V data received");
+  case SM_CODE_OTHER_SERVICE:
+    return N_("Other service without A/V streams");
 
   case SM_CODE_ABORTED:
     return N_("Aborted by user");
@@ -498,11 +523,11 @@ streaming_start_t *
 streaming_start_copy(const streaming_start_t *src)
 {
   int i;
-  size_t siz = sizeof(streaming_start_t) + 
+  size_t siz = sizeof(streaming_start_t) +
     sizeof(streaming_start_component_t) * src->ss_num_components;
-  
+
   streaming_start_t *dst = malloc(siz);
-  
+
   memcpy(dst, src, siz);
   service_source_info_copy(&dst->ss_si, &src->ss_si);
 
@@ -523,12 +548,11 @@ streaming_start_copy(const streaming_start_t *src)
 streaming_start_component_t *
 streaming_start_component_find_by_index(streaming_start_t *ss, int idx)
 {
+  streaming_start_component_t *ssc;
   int i;
-  for(i = 0; i < ss->ss_num_components; i++) {
-    streaming_start_component_t *ssc = &ss->ss_components[i];
-    if(ssc->ssc_index == idx)
+  for(i = 0, ssc = ss->ss_components; i < ss->ss_num_components; i++, ssc++)
+    if(ssc->es_index == idx)
       return ssc;
-  }
   return NULL;
 }
 
@@ -538,13 +562,17 @@ streaming_start_component_find_by_index(streaming_start_t *ss, int idx)
 static struct strtab streamtypetab[] = {
   { "NONE",       SCT_NONE },
   { "UNKNOWN",    SCT_UNKNOWN },
+  { "RAW",        SCT_RAW },
+  { "PCR",        SCT_PCR },
+  { "CAT",        SCT_CAT },
+  { "CA",         SCT_CA },
+  { "HBBTV",      SCT_HBBTV },
   { "MPEG2VIDEO", SCT_MPEG2VIDEO },
   { "MPEG2AUDIO", SCT_MPEG2AUDIO },
   { "H264",       SCT_H264 },
   { "AC3",        SCT_AC3 },
   { "TELETEXT",   SCT_TELETEXT },
   { "DVBSUB",     SCT_DVBSUB },
-  { "CA",         SCT_CA },
   { "AAC",        SCT_AAC },
   { "MPEGTS",     SCT_MPEGTS },
   { "TEXTSUB",    SCT_TEXTSUB },
@@ -554,6 +582,9 @@ static struct strtab streamtypetab[] = {
   { "VORBIS",     SCT_VORBIS },
   { "HEVC",       SCT_HEVC },
   { "VP9",        SCT_VP9 },
+  { "THEORA",     SCT_THEORA },
+  { "OPUS",       SCT_OPUS },
+  { "FLAC",       SCT_FLAC },
 };
 
 /**
@@ -585,6 +616,20 @@ streaming_component_audio_type2desc(int audio_type)
   return N_("Reserved");
 }
 
+static struct strtab signal_statetab[] = {
+  { "GOOD",       SIGNAL_GOOD    },
+  { "BAD",        SIGNAL_BAD     },
+  { "FAINT",      SIGNAL_FAINT   },
+  { "NONE",       SIGNAL_NONE    },
+};
+
+const char *signal2str(signal_state_t st)
+{
+  const char *r = val2str(st, signal_statetab);
+  if (!r) r = "UNKNOWN";
+  return r;
+}
+
 /*
  *
  */
@@ -595,7 +640,7 @@ void streaming_init(void)
 
 void streaming_done(void)
 {
-  pthread_mutex_lock(&global_lock);
+  tvh_mutex_lock(&global_lock);
   memoryinfo_unregister(&streaming_msg_memoryinfo);
-  pthread_mutex_unlock(&global_lock);
+  tvh_mutex_unlock(&global_lock);
 }

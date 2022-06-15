@@ -41,6 +41,7 @@ typedef enum {
   PROFILE_SVF_NONE = 0,
   PROFILE_SVF_SD,
   PROFILE_SVF_HD,
+  PROFILE_SVF_FHD,
   PROFILE_SVF_UHD
 } profile_svfilter_t;
 
@@ -68,17 +69,6 @@ typedef struct profile_build {
 typedef LIST_HEAD(, profile_build) profile_builders_queue;
 
 extern profile_builders_queue profile_builders;
-
-typedef struct profile_sharer {
-  streaming_target_t        prsh_input;
-  LIST_HEAD(,profile_chain) prsh_chains;
-  struct profile_chain     *prsh_master;
-  struct streaming_start   *prsh_start_msg;
-  struct streaming_target  *prsh_tsfix;
-#if ENABLE_LIBAV
-  struct streaming_target  *prsh_transcoder;
-#endif
-} profile_sharer_t;
 
 typedef struct profile_chain {
   LIST_ENTRY(profile_chain) prch_link;
@@ -137,15 +127,37 @@ typedef struct profile {
 
   void (*pro_free)(struct profile *pro);
   void (*pro_conf_changed)(struct profile *pro);
-  muxer_container_type_t (*pro_get_mc)(struct profile *pro);
 
   int (*pro_work)(profile_chain_t *prch, struct streaming_target *dst,
                   uint32_t timeshift_period, int flags);
-  int (*pro_reopen)(profile_chain_t *prch,
-                    muxer_config_t *m_cfg, int flags);
-  int (*pro_open)(profile_chain_t *prch,
-                  muxer_config_t *m_cfg, int flags, size_t qsize);
+  int (*pro_reopen)(profile_chain_t *prch, muxer_config_t *m_cfg,
+                    muxer_hints_t *hints, int flags);
+  int (*pro_open)(profile_chain_t *prch, muxer_config_t *m_cfg,
+                  muxer_hints_t *hints, int flags, size_t qsize);
 } profile_t;
+
+typedef struct profile_sharer_message {
+  TAILQ_ENTRY(profile_sharer_message) psm_link;
+  profile_chain_t *psm_prch;
+  streaming_message_t *psm_sm;
+} profile_sharer_message_t;
+
+typedef struct profile_sharer {
+  uint32_t                  prsh_do_queue: 1;
+  uint32_t                  prsh_queue_run: 1;
+  pthread_t                 prsh_queue_thread;
+  tvh_mutex_t               prsh_queue_mutex;
+  tvh_cond_t                prsh_queue_cond;
+  TAILQ_HEAD(,profile_sharer_message) prsh_queue;
+  streaming_target_t        prsh_input;
+  LIST_HEAD(,profile_chain) prsh_chains;
+  struct profile_chain     *prsh_master;
+  struct streaming_start   *prsh_start_msg;
+  struct streaming_target  *prsh_tsfix;
+#if ENABLE_LIBAV
+  struct streaming_target  *prsh_transcoder;
+#endif
+} profile_sharer_t;
 
 void profile_register(const idclass_t *clazz, profile_builder_t builder);
 
@@ -162,16 +174,16 @@ static inline void profile_release( profile_t *pro )
     if (--pro->pro_refcount == 0) profile_release_(pro);
   }
 
-int
-profile_chain_work(profile_chain_t *prch, struct streaming_target *dst,
-                   uint32_t timeshift_period, int flags);
-int
-profile_chain_reopen(profile_chain_t *prch,
-                     muxer_config_t *m_cfg, int flags);
-int
-profile_chain_open(profile_chain_t *prch,
-                   muxer_config_t *m_cfg, int flags, size_t qsize);
-void profile_chain_init(profile_chain_t *prch, profile_t *pro, void *id);
+int profile_chain_work(profile_chain_t *prch, struct streaming_target *dst,
+                       uint32_t timeshift_period, int flags);
+int profile_chain_reopen(profile_chain_t *prch,
+                         muxer_config_t *m_cfg,
+                         muxer_hints_t *hints, int flags);
+int profile_chain_open(profile_chain_t *prch,
+                       muxer_config_t *m_cfg,
+                       muxer_hints_t *hints,
+                       int flags, size_t qsize);
+void profile_chain_init(profile_chain_t *prch, profile_t *pro, void *id, int queue);
 int  profile_chain_raw_open(profile_chain_t *prch, void *id, size_t qsize, int muxer);
 void profile_chain_close(profile_chain_t *prch);
 int  profile_chain_weight(profile_chain_t *prch, int custom);
@@ -188,9 +200,6 @@ htsmsg_t * profile_class_get_list(void *o, const char *lang);
 char *profile_validate_name(const char *name);
 
 const char *profile_get_name(profile_t *pro);
-
-static inline muxer_container_type_t profile_get_mc(profile_t *pro)
-  { return pro->pro_get_mc(pro); }
 
 void profile_get_htsp_list(htsmsg_t *array, htsmsg_t *filter);
 

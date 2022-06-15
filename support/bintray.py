@@ -27,7 +27,9 @@ DEBUG=False
 BINTRAY_API='https://bintray.com/api/v1'
 BINTRAY_USER=env('BINTRAY_USER')
 BINTRAY_PASS=env('BINTRAY_PASS')
-BINTRAY_ORG='tvheadend'
+BINTRAY_REPO=env('BINTRAY_REPO')
+BINTRAY_COMPONENT=env('BINTRAY_COMPONENT')
+BINTRAY_ORG=env('BINTRAY_ORG') or 'tvheadend'
 BINTRAY_PACKAGE='tvheadend'
 
 PACKAGE_DESC='Tvheadend is a TV streaming server and recorder for Linux, FreeBSD and Android'
@@ -37,8 +39,11 @@ class Response(object):
         self.url = response.geturl()
         self.code = response.getcode()
         self.reason = response.msg
-        self.body = response.read()
         self.headers = response.info()
+        if 'Content-type' in self.headers and self.headers['Content-type'] == 'application/json':
+          self.body = json.loads(response.read())
+        else:
+          self.body = response.read()
 
 class Bintray(object):
 
@@ -73,6 +78,12 @@ class Bintray(object):
             r = Response(e)
         return r
 
+    def get(self, binary=None):
+        return self._push(None, method='GET')
+
+    def delete(self, binary=None):
+        return self._push(None, method='DELETE')
+
     def put(self, data, binary=None):
         return self._push(data, binary)
     
@@ -92,10 +103,12 @@ def do_upload(*args):
     data = open(file, 'rb').read()
     resp = Bintray(bpath).put(data, binary=1)
     if resp.code != 200 and resp.code != 201:
+        if resp.code == 409:
+            error(0, 'HTTP WARNING "%s" %s %s', resp.url, resp.code, resp.reason)
         error(10, 'HTTP ERROR "%s" %s %s', resp.url, resp.code, resp.reason)
 
 def get_ver(version):
-    if version.find('-'):
+    if version.find('-') > 0:
         version, git = version.split('-', 1)
     else:
         git = None
@@ -109,7 +122,7 @@ def get_ver(version):
 def get_path(version, repo):
     major, minor, rest, git = get_ver(version)
     if int(major) >= 4 and int(minor) & 1 == 0:
-        if repo in ['fedora', 'centos', 'rhel'] and git.find('~') > 0:
+        if repo in ['fedora', 'centos', 'rhel'] and git.find('~') <= 0:
             return '%s.%s-release' % (major, minor)
         return '%s.%s' % (major, minor)
     return 't'
@@ -117,13 +130,14 @@ def get_path(version, repo):
 def get_component(version):
     major, minor, rest, git = get_ver(version)
     if int(major) >= 4 and int(minor) & 1 == 0:
-        if git.find('~') > 0:
+        if git and git.find('~') > 0:
             return 'stable-%s.%s' % (major, minor)
         return 'release-%s.%s' % (major, minor)
     return 'unstable'
 
 def get_repo(filename, hint=None):
     if hint: return hint
+    if BINTRAY_REPO: return BINTRAY_REPO
     name, ext = os.path.splitext(filename)
     if ext == '.deb':
         return 'deb'
@@ -134,6 +148,17 @@ def get_repo(filename, hint=None):
             return 'fedora'
         elif name.find('.el') > 0:
             return 'rhel'
+
+def rpmversion(name):
+    ver = type('',(object,),{})()
+    rpmbase, ver.arch = name.rsplit('.', 1)
+    rpmname, rpmversion = rpmbase.rsplit('-', 1)
+    rpmname, rpmversion2 = rpmname.rsplit('-', 1)
+    rpmversion = rpmversion2 + '-' + rpmversion
+    rpmver1, rpmver2 = rpmversion.split('-', 1)
+    rpmversion, ver.dist = rpmver2.split('.', 1)
+    ver.version = rpmver1 + '-' + rpmversion
+    return ver
 
 def get_bintray_params(filename, hint=None):
     filename = filename.strip()
@@ -146,30 +171,27 @@ def get_bintray_params(filename, hint=None):
     extra = []
     if args.repo == 'deb':
         debbase, debarch = name.rsplit('_', 1)
-        debname, debversion = debbase.split('_', 1)
+        try:
+            debname, debversion = debbase.split('_', 1)
+        except:
+            debname, debversion = debbase.split('-', 1)
         debversion, debdistro = debversion.rsplit('~', 1)
         args.version = debversion
         args.path = 'pool/' + get_path(debversion, args.repo) + '/' + args.package
-        extra.append('deb_component=' + get_component(debversion))
+        extra.append('deb_component=' + (BINTRAY_COMPONENT or get_component(debversion)))
         extra.append('deb_distribution=' + debdistro)
         extra.append('deb_architecture=' + debarch)
     else:
-        rpmbase, rpmarch = name.rsplit('.', 1)
-        rpmname, rpmversion = rpmbase.rsplit('-', 1)
-        if rpmversion.find('~') > 0:
-            rpmname, rpmversion2 = rpmname.rsplit('-', 1)
-            rpmversion = rpmversion2 + '-' + rpmversion
-        rpmver1, rpmver2 = rpmversion.split('-', 1)
-        rpmversion, rpmdist = rpmver2.split('.', 1)
-        rpmversion = rpmver1 + '-' + rpmversion
-        args.version = rpmversion
-        args.path = 'linux/' + get_path(rpmversion, args.repo) + \
-                    '/' + rpmdist + '/' + rpmarch
+        rpmver = rpmversion(name)
+        args.version = rpmver.version
+        args.path = 'linux/' + get_path(rpmver.version, args.repo) + \
+                    '/' + rpmver.dist + '/' + rpmver.arch
     extra = ';'.join(extra)
     if extra: extra = ';' + extra
     return (basename, args, extra)
 
 def do_publish(*args):
+    return
     if len(args) < 1: error(1, 'upload [file with the file list]')
     if not DEBUG:
         branches = os.popen('git branch --contains HEAD').readlines()
@@ -205,21 +227,101 @@ def do_publish(*args):
     if resp.code != 200 and resp.code != 201 and resp.code != 409:
         error(10, 'Version %s/%s: HTTP ERROR %s %s',
                   args.repo, args.version, resp.code, resp.reason)
-    else:
-        info('Version %s/%s created', args.repo, args.version)
+    info('Version %s/%s created', args.repo, args.version)
     for file in files:
         file = file.strip()
         basename, args, extra = get_bintray_params(file, hint)
-        bpath = '/content/%s/%s/%s/%s/%s/%s%s;publish=1' % \
+        pub = 1
+        if "-dirty" in basename.lower():
+            pub = 0
+        bpath = '/content/%s/%s/%s/%s/%s/%s%s;publish=%s' % \
                 (args.org, args.repo, args.package, args.version,
-                 args.path, basename, extra)
+                 args.path, basename, extra, pub)
         data = open(file, 'rb').read()
         resp = Bintray(bpath).put(data, binary=1)
         if resp.code != 200 and resp.code != 201:
-            error(10, 'File %s: HTTP ERROR "%s" %s',
-                      file, resp.code, resp.reason)
+            error(10, 'File %s (%s): HTTP ERROR "%s" %s',
+                      file, bpath, resp.code, resp.reason)
         else:
             info('File %s: uploaded', file)
+
+def get_versions(repo, package):
+    bpath = '/packages/%s/%s/%s' % (BINTRAY_ORG, repo, package)
+    resp = Bintray(bpath).get()
+    if resp.code != 200 and resp.code != 201:
+        error(10, ' %s/%s: HTTP ERROR %s %s',
+               repo, package, resp.code, resp.reason)
+    return resp.body
+
+def get_files(repo, package, unpublished=0):
+    bpath = '/packages/%s/%s/%s/files?include_unpublished=%d' % (BINTRAY_ORG, repo, package, unpublished)
+    resp = Bintray(bpath).get()
+    if resp.code != 200 and resp.code != 201:
+        error(10, ' %s/%s: HTTP ERROR %s %s',
+               repo, package, resp.code, resp.reason)
+    return resp.body
+
+def delete_file(repo, file):
+    bpath = '/content/%s/%s/%s' % (BINTRAY_ORG, repo, urllib.quote(file))
+    resp = Bintray(bpath).delete()
+    if resp.code != 200 and resp.code != 201:
+        error(10, ' %s/%s: HTTP ERROR %s %s',
+               repo, file, resp.code, resp.reason)
+
+def delete_up_to_count(repo, files, max_count, auxfcn=None):
+    files.sort(key=lambda x: x['sortkey'], reverse=True)
+    key = ''
+    count = 0
+    for f in files:
+      a, b = f['sortkey'].split('*')
+      if a == key:
+        if count > max_count:
+          info('delete %s', f['path'])
+          if auxfcn:
+              auxfcn(repo, f['path'])
+          else:
+              delete_file(repo, f['path'])
+        else:
+          info('keep %s', f['path'])
+        count += 1
+      else:
+        key = a
+        count = 0
+
+def do_tidy(*args):
+
+    def fedora_delete(repo, path):
+        rest = '-' + '-'.join(path.split('tvheadend-')[1:])
+        for f in files:
+            if f['path'].find(rest) >= 0:
+                delete_file(repo, f['path'])
+
+    def fedora_files(repo):
+      files = get_files(repo, 'tvheadend')
+      sfiles = []
+      for f in files:
+        if f['name'].startswith('tvheadend-debuginfo-'):
+          continue
+        if f['name'].find('~') < 0:
+          continue
+        name, ext = os.path.splitext(f['name'])
+        rpmver = rpmversion(name)
+        f['ver1'], f['ver2'] = rpmver.version.split('~')[0].split('-')
+        f['sortkey'] = "%s/%s/%s*%08d" % (rpmver.dist, rpmver.arch, f['ver1'], long(f['ver2']))
+        sfiles.append(f)
+      return files, sfiles
+
+    files, sfiles = fedora_files('centos')
+    delete_up_to_count('centos', sfiles, 10, fedora_delete)
+
+    files, sfiles = fedora_files('fedora')
+    delete_up_to_count('fedora', sfiles, 10, fedora_delete)
+
+    #files = get_files('misc', 'staticlib', 1)
+    #for f in files:
+    #  a, b = f['path'].split('-')
+    #  f['sortkey'] = a + '*' + f['created']
+    #delete_up_to_count('misc', files, 4)
 
 def do_unknown(*args):
     r = 'Please, specify a valid command:\n'
@@ -228,11 +330,37 @@ def do_unknown(*args):
             r += '  ' + n[3:] + '\n'
     error(1, r[:-1])
 
+def test_filename():
+    FILES=[
+        "tvheadend_4.3-86~g7d2c4e8~xenial_amd64.deb",
+        "tvheadend_4.3-86~g7d2c4e8~xenial_arm64.deb",
+        "tvheadend_4.3-666~a6b0mfyj-dirty~jessie_armhf.deb",
+        "tvheadend-4.3-86~g7d2c4e8.el7.centos.x86_64.rpm",
+        "tvheadend-4.3-86~g7d2c4e8.fc24.x86_64.rpm",
+        "tvheadend-4.2.2~xenial_amd64.deb",
+        "tvheadend_4.2.2~xenial_arm64.deb",
+        "tvheadend-4.2.2-1.el7.centos.x86_64.rpm",
+        "tvheadend-4.2.2-1.fc24.x86_64.rpm",
+        "tvheadend-4.2.2-1~g82c8872~xenial_amd64.deb",
+        "tvheadend_4.2.2-1~g82c8872~xenial_arm64.deb",
+        "tvheadend-4.2.2-1~g82c8872.el7.centos.x86_64.rpm",
+        "tvheadend-4.2.2-1~g82c8872.fc24.x86_64.rpm",
+    ]
+    from pprint import pprint
+    for f in FILES:
+        basename, args, extra = get_bintray_params(f)
+        print('\n')
+        print('BASENAME:', basename)
+        print('EXTRA:', extra)
+        pprint(vars(args), indent=2)
+
 def main(argv):
     global DEBUG
+    if len(argv) > 1 and argv[1] == '--test-filename':
+        return test_filename()
     if not BINTRAY_USER or not BINTRAY_PASS:
         error(2, 'No credentals')
-    if argv[1] == '--debug':
+    if len(argv) > 1 and argv[1] == '--debug':
         DEBUG=1
         argv.pop(0)
     cmd = 'do_' + (len(argv) > 1 and argv[1] or 'unknown')

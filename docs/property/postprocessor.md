@@ -14,7 +14,9 @@ Format | Description                               | Example value
 `%O`   | Owner of this recording                   |  user
 `%C`   | Who created this recording                |  user
 `%t`   | Program title                             |  News
-`%s`   | Program subtitle                          |  Afternoon
+`%s`   | Program subtitle or summary               |  Afternoon fast news
+`%u`   | Program subtitle                          |  Afternoon
+`%m`   | Program summary                           |  Afternoon fast news
 `%p`   | Program episode                           |  S02.E07
 `%d`   | Program description                       |  News and stories…
 `%g`   | Program content type                      |  Current affairs
@@ -24,6 +26,8 @@ Format | Description                               | Example value
 `%r`   | Number of errors during recording         |  0
 `%R`   | Number of data errors during recording    |  6
 `%i`   | Streams (comma separated)                 |  H264,AC3,TELETEXT
+`%U`   | Unique ID of recording                    |  3cf44328eda87a428ba9a8b14876ab80
+`%Z`   | Comment                                   |  A string
 
 *Example usage*
 

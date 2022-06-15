@@ -16,19 +16,24 @@
  *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "tvhlog.h"
-#include <pthread.h>
-#include <string.h>
 #include <stdio.h>
+#include "tvhlog.h"
+#include <string.h>
 #include <stdlib.h>
 #include <sys/time.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
 
 #if ENABLE_EXECINFO
 #include <execinfo.h>
 #endif
 
 #include "bitops.h"
+#include "settings.h"
 #include "libav.h"
+#include "tcp.h"
 #include "webui/webui.h"
 
 #define TVHLOG_BITARRAY ((LS_LAST + (BITS_PER_LONG - 1)) / BITS_PER_LONG)
@@ -40,11 +45,15 @@ char                    *tvhlog_path;
 bitops_ulong_t           tvhlog_debug[TVHLOG_BITARRAY];
 bitops_ulong_t           tvhlog_trace[TVHLOG_BITARRAY];
 pthread_t                tvhlog_tid;
-pthread_mutex_t          tvhlog_mutex;
+tvh_mutex_t              tvhlog_mutex;
 tvh_cond_t               tvhlog_cond;
 TAILQ_HEAD(,tvhlog_msg)  tvhlog_queue;
 int                      tvhlog_queue_size;
 int                      tvhlog_queue_full;
+#if ENABLE_TRACE
+int                      tvhlog_rtfd = STDOUT_FILENO;
+struct sockaddr_storage  tvhlog_rtss;
+#endif
 
 #define TVHLOG_QUEUE_MAXSIZE 10000
 #define TVHLOG_THREAD 1
@@ -77,8 +86,8 @@ tvhlog_subsys_t tvhlog_subsystems[] = {
   [LS_CRASH]         = { "CRASH",         N_("CRASH") },
   [LS_CPU]           = { "CPU",           N_("CPU") },
   [LS_MAIN]          = { "main",          N_("Main") },
-  [LS_GTIMER]        = { "gtimer",        N_("Global timer") },
-  [LS_MTIMER]        = { "mtimer",        N_("Monitonic timer") },
+  [LS_TPROF]         = { "tprof",         N_("Time profiling") },
+  [LS_QPROF]         = { "qprof",         N_("Queue profiling") },
   [LS_THREAD]        = { "thread",        N_("Thread") },
   [LS_TVHPOLL]       = { "tvhpoll",       N_("Poll multiplexer") },
   [LS_TIME]          = { "time",          N_("Time") },
@@ -115,9 +124,10 @@ tvhlog_subsys_t tvhlog_subsystems[] = {
   [LS_TBL_PASS]      = { "tbl-pass",      N_("Passthrough Muxer SI Tables") },
   [LS_TBL_SATIP]     = { "tbl-satip",     N_("SAT>IP Server SI Tables") },
   [LS_FASTSCAN]      = { "fastscan",      N_("Fastscan DVB") },
+  [LS_PCR]           = { "pcr",           N_("PCR Clocks") },
   [LS_PARSER]        = { "parser",        N_("MPEG-TS Parser") },
   [LS_TS]            = { "TS",            N_("Transport Stream") },
-  [LS_GLOBALHEADERS] = { "globalheaders", N_("Global Headers") }, 
+  [LS_GLOBALHEADERS] = { "globalheaders", N_("Global Headers") },
   [LS_TSFIX]         = { "tsfix",         N_("Time Stamp Fix") },
   [LS_HEVC]          = { "hevc",          N_("HEVC - H.265") },
   [LS_MUXER]         = { "muxer",         N_("Muxer") },
@@ -137,8 +147,10 @@ tvhlog_subsys_t tvhlog_subsystems[] = {
   [LS_CSA]           = { "csa",           N_("CSA (descrambling)") },
   [LS_CAPMT]         = { "capmt",         N_("CAPMT CA Client") },
   [LS_CWC]           = { "cwc",           N_("CWC CA Client") },
+  [LS_CCCAM]         = { "cccam",         N_("CWC CCCam Client") },
   [LS_DVBCAM]        = { "dvbcam",        N_("DVB CAM Client") },
   [LS_DVR]           = { "dvr",           N_("Digital Video Recorder") },
+  [LS_DVR_INOTIFY]   = { "dvr-inotify",   N_("DVR Inotify") },
   [LS_EPG]           = { "epg",           N_("Electronic Program Guide") },
   [LS_EPGDB]         = { "epgdb",         N_("EPG Database") },
   [LS_EPGGRAB]       = { "epggrab",       N_("EPG Grabber") },
@@ -157,7 +169,7 @@ tvhlog_subsys_t tvhlog_subsystems[] = {
   [LS_EN50494]       = { "en50494",       N_("Unicable (EN50494)") },
   [LS_SATIP]         = { "satip",         N_("SAT>IP Client") },
   [LS_SATIPS]        = { "satips",        N_("SAT>IP Server") },
-  [LS_TVHDHOMERUN]   = { "tvhdhomerun",   N_("TVHDHomeRun Client") }, 
+  [LS_TVHDHOMERUN]   = { "tvhdhomerun",   N_("TVHDHomeRun Client") },
   [LS_PSIP]          = { "psip",          N_("ATSC PSIP EPG") },
   [LS_OPENTV]        = { "opentv",        N_("OpenTV EPG") },
   [LS_PYEPG]         = { "pyepg",         N_("PyEPG Import") },
@@ -167,6 +179,12 @@ tvhlog_subsys_t tvhlog_subsystems[] = {
   [LS_SCANFILE]      = { "scanfile",      N_("Scanfile") },
   [LS_TSFILE]        = { "tsfile",        N_("MPEG-TS File") },
   [LS_TSDEBUG]       = { "tsdebug",       N_("MPEG-TS Input Debug") },
+  [LS_CODEC]         = { "codec",         N_("Codec") },
+  [LS_VAAPI]         = { "vaapi",         N_("VA-API") },
+#if ENABLE_DDCI
+  [LS_DDCI]          = { "ddci",          N_("DD-CI") },
+#endif
+
 };
 
 static void
@@ -222,7 +240,7 @@ tvhlog_set_subsys ( bitops_ulong_t *c, const char *subsys )
           break;
         }
       if (i >= LS_LAST)
-        tvherror(LS_CONFIG, "uknown subsystem '%s'", t);
+        tvherror(LS_CONFIG, "unknown subsystem '%s'", t);
     }
 next:
     t = strtok_r(NULL, ",", &r);
@@ -281,12 +299,8 @@ tvhlog_process
 
   /* Comet (debug must still be enabled??) */
   if (msg->notify && msg->severity < LOG_TRACE) {
-    htsmsg_t *m = htsmsg_create_map();
     snprintf(buf, sizeof(buf), "%s %s", t, msg->msg);
-    htsmsg_add_str(m, "notificationClass", "logmessage");
-    htsmsg_add_str(m, "logtxt", buf);
-    comet_mailbox_add_message(m, msg->severity >= LOG_DEBUG, 0);
-    htsmsg_destroy(m);
+    comet_mailbox_add_logmsg(buf, msg->severity >= LOG_DEBUG, 0);
   }
 
   /* Console */
@@ -295,7 +309,7 @@ tvhlog_process
       const char *ltxt = logtxtmeta[msg->severity][0];
       const char *sgr  = logtxtmeta[msg->severity][1];
       const char *sgroff;
-    
+
       if (options & TVHLOG_OPT_DECORATE)
         sgroff = "\033[0m";
       else {
@@ -316,7 +330,7 @@ tvhlog_process
         fprintf(*fp, "%s [%7s]:%s\n", t, ltxt, msg->msg);
     }
   }
-  
+
   free(msg->msg);
   free(msg);
 }
@@ -330,7 +344,7 @@ tvhlog_thread ( void *p )
   FILE *fp = NULL;
   tvhlog_msg_t *msg;
 
-  pthread_mutex_lock(&tvhlog_mutex);
+  tvh_mutex_lock(&tvhlog_mutex);
   while (tvhlog_run) {
 
     /* Wait */
@@ -351,20 +365,20 @@ tvhlog_thread ( void *p )
     /* Copy options and path */
     if (!fp) {
       if (tvhlog_path) {
-        strncpy(buf, tvhlog_path, sizeof(buf));
+        strlcpy(buf, tvhlog_path, sizeof(buf));
         path = buf;
       } else {
         path = NULL;
       }
     }
-    options  = tvhlog_options; 
-    pthread_mutex_unlock(&tvhlog_mutex);
+    options  = tvhlog_options;
+    tvh_mutex_unlock(&tvhlog_mutex);
     tvhlog_process(msg, options, &fp, path);
-    pthread_mutex_lock(&tvhlog_mutex);
+    tvh_mutex_lock(&tvhlog_mutex);
   }
   if (fp)
     fclose(fp);
-  pthread_mutex_unlock(&tvhlog_mutex);
+  tvh_mutex_unlock(&tvhlog_mutex);
   return NULL;
 }
 
@@ -393,11 +407,11 @@ void tvhlogv ( const char *file, int line, int severity,
   if (!ok)
     return;
 
-  pthread_mutex_lock(&tvhlog_mutex);
+  tvh_mutex_lock(&tvhlog_mutex);
 
   /* Check for full */
   if (tvhlog_queue_full) {
-    pthread_mutex_unlock(&tvhlog_mutex);
+    tvh_mutex_unlock(&tvhlog_mutex);
     return;
   }
 
@@ -442,7 +456,7 @@ void tvhlogv ( const char *file, int line, int severity,
 #if TVHLOG_THREAD
   }
 #endif
-  pthread_mutex_unlock(&tvhlog_mutex);
+  tvh_mutex_unlock(&tvhlog_mutex);
 }
 
 
@@ -519,28 +533,70 @@ tvhlog_backtrace_printf(const char *fmt, ...)
 }
 
 /*
+ *
+ */
+#if ENABLE_TRACE
+static void tvhdbgv(int subsys, const char *fmt, va_list *args)
+{
+  char buf[2048];
+  size_t l = 0;
+
+  if (tvhlog_rtfd < 0) return;
+  tvh_strlcatf(buf, sizeof(buf), l, "%s: ", tvhlog_subsystems[subsys].name);
+  l += vsnprintf(buf + l, sizeof(buf) - l, fmt, *args);
+  if (l + 1 < sizeof(buf))
+    buf[l++] = '\n';
+  sendto(tvhlog_rtfd, buf, l, 0, (struct sockaddr *)&tvhlog_rtss, sizeof(struct sockaddr_in));
+}
+#endif
+
+/*
+ *
+ */
+#if ENABLE_TRACE
+void tvhdbg(int subsys, const char *fmt, ...)
+{
+  va_list args;
+  va_start(args, fmt);
+  tvhdbgv(subsys, fmt, &args);
+  va_end(args);
+}
+#endif
+
+/*
  * Initialise
  */
-void 
+void
 tvhlog_init ( int level, int options, const char *path )
 {
-  tvhlog_level   = level;
+  atomic_set(&tvhlog_level, level);
   tvhlog_options = options;
   tvhlog_path    = path ? strdup(path) : NULL;
   memset(tvhlog_trace, 0, sizeof(tvhlog_trace));
   memset(tvhlog_debug, 0, sizeof(tvhlog_debug));
   tvhlog_run     = 1;
   openlog("tvheadend", LOG_PID, LOG_DAEMON);
-  pthread_mutex_init(&tvhlog_mutex, NULL);
-  tvh_cond_init(&tvhlog_cond);
+  tvh_mutex_init(&tvhlog_mutex, NULL);
+  tvh_cond_init(&tvhlog_cond, 1);
   TAILQ_INIT(&tvhlog_queue);
+#if ENABLE_TRACE
+  {
+    const char *rtport0 = getenv("TVHEADEND_RTLOG_UDP_PORT");
+    int rtport = rtport0 ? atoi(rtport0) : 0;
+    if (rtport > 0) {
+      tvhlog_rtfd = tvh_socket(AF_INET, SOCK_DGRAM, 0);
+      tcp_get_ip_from_str("127.0.0.1", &tvhlog_rtss);
+      IP_AS_V4(tvhlog_rtss, port) = htons(rtport);
+    }
+  }
+#endif
 }
 
 void
 tvhlog_start ( void )
 {
   idclass_register(&tvhlog_conf_class);
-  tvhthread_create(&tvhlog_tid, NULL, tvhlog_thread, NULL, "log");
+  tvh_thread_create(&tvhlog_tid, NULL, tvhlog_thread, NULL, "log");
 }
 
 void
@@ -548,21 +604,27 @@ tvhlog_end ( void )
 {
   FILE *fp = NULL;
   tvhlog_msg_t *msg;
-  pthread_mutex_lock(&tvhlog_mutex);
+  tvh_mutex_lock(&tvhlog_mutex);
   tvhlog_run = 0;
   tvh_cond_signal(&tvhlog_cond, 0);
-  pthread_mutex_unlock(&tvhlog_mutex);
+  tvh_mutex_unlock(&tvhlog_mutex);
   pthread_join(tvhlog_tid, NULL);
-  pthread_mutex_lock(&tvhlog_mutex);
+  tvh_mutex_lock(&tvhlog_mutex);
   while ((msg = TAILQ_FIRST(&tvhlog_queue)) != NULL) {
     TAILQ_REMOVE(&tvhlog_queue, msg, link);
     tvhlog_process(msg, tvhlog_options, &fp, tvhlog_path);
   }
   tvhlog_queue_full = 1;
-  pthread_mutex_unlock(&tvhlog_mutex);
+  tvh_mutex_unlock(&tvhlog_mutex);
   if (fp)
     fclose(fp);
   free(tvhlog_path);
+#if ENABLE_TRACE
+  if (tvhlog_rtfd >= 0) {
+    close(tvhlog_rtfd);
+    tvhlog_rtfd = 1;
+  }
+#endif
   closelog();
 }
 
@@ -581,14 +643,14 @@ tvhlog_class_path_set ( void *o, const void *v )
 {
   const char *s = v;
   if (strcmp(s ?: "", tvhlog_path ?: "")) {
-    pthread_mutex_lock(&tvhlog_mutex);
+    tvh_mutex_lock(&tvhlog_mutex);
     free(tvhlog_path);
     tvhlog_path = strdup(s ?: "");
     if (tvhlog_path && tvhlog_path[0])
       tvhlog_options |= TVHLOG_OPT_DBG_FILE;
     else
       tvhlog_options &= ~TVHLOG_OPT_DBG_FILE;
-    pthread_mutex_unlock(&tvhlog_mutex);
+    tvh_mutex_unlock(&tvhlog_mutex);
     return 1;
   }
   return 0;
@@ -635,12 +697,12 @@ tvhlog_class_enable_syslog_get ( void *o )
 static int
 tvhlog_class_enable_syslog_set ( void *o, const void *v )
 {
-  pthread_mutex_lock(&tvhlog_mutex);
+  tvh_mutex_lock(&tvhlog_mutex);
   if (*(int *)v)
     tvhlog_options |= TVHLOG_OPT_SYSLOG;
   else
     tvhlog_options &= ~TVHLOG_OPT_SYSLOG;
-  pthread_mutex_unlock(&tvhlog_mutex);
+  tvh_mutex_unlock(&tvhlog_mutex);
   return 1;
 }
 
@@ -655,12 +717,12 @@ tvhlog_class_debug_syslog_get ( void *o )
 static int
 tvhlog_class_debug_syslog_set ( void *o, const void *v )
 {
-  pthread_mutex_lock(&tvhlog_mutex);
+  tvh_mutex_lock(&tvhlog_mutex);
   if (*(int *)v)
     tvhlog_options |= TVHLOG_OPT_DBG_SYSLOG;
   else
     tvhlog_options &= ~TVHLOG_OPT_DBG_SYSLOG;
-  pthread_mutex_unlock(&tvhlog_mutex);
+  tvh_mutex_unlock(&tvhlog_mutex);
   return 1;
 }
 
@@ -690,13 +752,13 @@ tvhlog_class_libav_get ( void *o )
 static int
 tvhlog_class_libav_set ( void *o, const void *v )
 {
-  pthread_mutex_lock(&tvhlog_mutex);
+  tvh_mutex_lock(&tvhlog_mutex);
   if (*(int *)v)
     tvhlog_options |= TVHLOG_OPT_LIBAV;
   else
     tvhlog_options &= ~TVHLOG_OPT_LIBAV;
   libav_set_loglevel();
-  pthread_mutex_unlock(&tvhlog_mutex);
+  tvh_mutex_unlock(&tvhlog_mutex);
   return 1;
 }
 
@@ -715,8 +777,16 @@ const idclass_t tvhlog_conf_class = {
   .ic_perm_def   = ACCESS_ADMIN,
   .ic_groups     = (const property_group_t[]) {
     {
-      .name   = N_("Settings"),
+      .name   = N_("General Settings"),
       .number = 1,
+    },
+    {
+      .name   = N_("Subsystem Output Settings"),
+      .number = 2,
+    },
+    {
+      .name   = N_("Miscellaneous Settings"),
+      .number = 3,
     },
     {}
   },
@@ -724,10 +794,9 @@ const idclass_t tvhlog_conf_class = {
     {
       .type   = PT_STR,
       .id     = "path",
-      .name   = N_("Debug log path"),
-      /* Should this really be called Debug log path? Don't you need to
-       * enter a filename here not just a path? */
-      .desc   = N_("Enter a filename you want to save the debug log to."),
+      .name   = N_("Filename (including path)"),
+      .desc   = N_("Enter the filename (including path) where "
+                   "Tvheadend should write the log."),
       .get    = tvhlog_class_path_get,
       .set    = tvhlog_class_path_set,
       .group  = 1,
@@ -751,18 +820,6 @@ const idclass_t tvhlog_conf_class = {
       .group  = 1,
     },
     {
-      .type   = PT_STR,
-      .id     = "debugsubs",
-      .name   = N_("Debug subsystems"),
-      .desc   = N_("Enter comma-separated list of subsystems you want "
-                   "debugging output for (e.g "
-                   "+linuxdvb,+subscriptions,+mpegts)."),
-      .get    = tvhlog_class_debugsubs_get,
-      .set    = tvhlog_class_debugsubs_set,
-      .opts   = PO_MULTILINE,
-      .group  = 1,
-    },
-    {
       .type   = PT_BOOL,
       .id     = "trace",
       .name   = N_("Debug trace (low-level)"),
@@ -776,10 +833,22 @@ const idclass_t tvhlog_conf_class = {
     },
     {
       .type   = PT_STR,
+      .id     = "debugsubs",
+      .name   = N_("Debug subsystems"),
+      .desc   = N_("Enter comma-separated list of subsystems you want "
+                   "debugging output for (e.g. "
+                   "linuxdvb,subscription,mpegts)."),
+      .get    = tvhlog_class_debugsubs_get,
+      .set    = tvhlog_class_debugsubs_set,
+      .opts   = PO_MULTILINE,
+      .group  = 2,
+    },
+    {
+      .type   = PT_STR,
       .id     = "tracesubs",
       .name   = N_("Trace subsystems"),
       .desc   = N_("Enter comma-separated list of subsystems you want "
-                   "to get traces for (e.g +linuxdvb,+subscriptions,+mpegts)."),
+                   "to get traces for (e.g linuxdvb,subscription,mpegts)."),
       .get    = tvhlog_class_tracesubs_get,
       .set    = tvhlog_class_tracesubs_set,
 #if !ENABLE_TRACE
@@ -787,7 +856,7 @@ const idclass_t tvhlog_conf_class = {
 #else
       .opts   = PO_MULTILINE,
 #endif
-      .group  = 1,
+      .group  = 2,
     },
     {
       .type   = PT_BOOL,
@@ -796,7 +865,7 @@ const idclass_t tvhlog_conf_class = {
       .desc   = N_("Enable/disable libav log output."),
       .get    = tvhlog_class_libav_get,
       .set    = tvhlog_class_libav_set,
-      .group  = 1,
+      .group  = 3,
     },
     {}
   }

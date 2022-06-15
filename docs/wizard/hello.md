@@ -1,19 +1,15 @@
-Welcome to Tvheadend, your TV streaming server and video recorder. This 
-wizard will help you get up and running fast. Let's start by configuring 
-the basic language settings. Please select the default user interface 
-and EPG language(s).
+**Welcome to Tvheadend, Your TV Streaming Server and Video Recorder**
 
-**This wizard should only be run on initial setup. Please cancel it if 
-you're not willing to touch the current configuration, as continuing in 
-such cases can lead to misconfiguration and not all changes made thru 
-this wizard will take effect.**
+Let's start by configuring the basic language settings. Please select 
+the default user interface and EPG language(s).
 
-**Notes**:
-* If you cannot see your preferred language in the language list and would 
-like to help translate Tvheadend see 
-[here](https://tvheadend.org/projects/tvheadend/wiki/Internationalization). 
-* If you don't enter a preferred language, US English will be used as a default. 
-* Not selecting the correct EPG language can result in garbled EPG 
-text; if this happens, don't panic, as you can easily change it later.
+* This wizard is optional, and can be cancelled at any time, but
+recommended for new users.
+* Running this wizard on existing configurations is NOT a good idea as
+it may lead to confusion, misconfiguration and unexpected features! ;)
+* The wizard will restart and reload the interface in your chosen
+language, unfortunately not all translations are available/complete.
+* If you get stuck at any point and need a little more information, 
+press [Help].
 
-**The interface will reload in your chosen language (if the translation is available).**
+

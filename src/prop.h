@@ -52,32 +52,35 @@ typedef enum {
 #define PO_ADVANCED  (1<<4)  // Property is advanced
 #define PO_EXPERT    (1<<5)  // Property is for experts
 #define PO_NOUI      (1<<6)  // Property should not be presented in the user interface
-#define PO_HIDDEN    (1<<7)  // Property is hidden (by default)
-#define PO_USERAW    (1<<8)  // Only save the RAW (off) value if it exists
-#define PO_SORTKEY   (1<<9)  // Sort using key (not display value)
-#define PO_PASSWORD  (1<<10) // String is a password
-#define PO_DURATION  (1<<11) // For PT_TIME - differentiate between duration and datetime
-#define PO_HEXA      (1<<12) // Hexadecimal value
-#define PO_DATE      (1<<13) // Show date only
-#define PO_LOCALE    (1<<14) // Call tvh_locale_lang on string
-#define PO_LORDER    (1<<15) // Manage order in lists
-#define PO_MULTILINE (1<<16) // Multiline string
-#define PO_PERSIST   (1<<17) // Persistent value (return back on save)
-#define PO_DOC       (1<<18) // Use doc callback instead description if exists
-#define PO_DOC_NLIST (1<<19) // Do not show list in doc
-#define PO_TRIM      (1<<20) // Trim whitespaces (left & right) on load
+#define PO_HIDDEN    (1<<7)  // Property column is hidden (by default)
+#define PO_PHIDDEN   (1<<8)  // Property is permanently hidden
+#define PO_USERAW    (1<<9)  // Only save the RAW (off) value if it exists
+#define PO_SORTKEY   (1<<10) // Sort using key (not display value)
+#define PO_PASSWORD  (1<<11) // String is a password
+#define PO_DURATION  (1<<12) // For PT_TIME - differentiate between duration and datetime
+#define PO_HEXA      (1<<13) // Hexadecimal value
+#define PO_DATE      (1<<14) // Show date only
+#define PO_LOCALE    (1<<15) // Call tvh_locale_lang on string
+#define PO_LORDER    (1<<16) // Manage order in lists
+#define PO_MULTILINE (1<<17) // Multiline string
+#define PO_PERSIST   (1<<18) // Persistent value (return back on save)
+#define PO_DOC       (1<<19) // Use doc callback instead description if exists
+#define PO_DOC_NLIST (1<<20) // Do not show list in doc
+#define PO_TRIM      (1<<21) // Trim whitespaces (left & right) on load
 
 /*
  * min/max/step helpers
  */
 #define INTEXTRA_RANGE(min, max, step) \
-  ((1<<31)|(((step)&0x7f)<<24)|(((max)&0xfff)<<12)|((min)&0xfff))
+  ((1<<31U)|(((step)&0x7fU)<<24)|(((max)&0xfffU)<<12)|((min)&0xfffU))
 
-#define INTEXTRA_IS_RANGE(e) (((e) & (1<<31)) != 0)
+#define INTEXTRA_IS_RANGE(e) (((e) & (1<<31U)) != 0)
 #define INTEXTRA_IS_SPLIT(e) !INTEXTRA_IS_RANGE(e)
-#define INTEXTRA_GET_STEP(e) (((e)>>24)&0x7f)
-#define INTEXTRA_GET_MAX(e)  ((e)&(1<<23)?-(((e)>>12)&0x7ff):(((e)>>12)&0x7ff))
-#define INTEXTRA_GET_MIN(e)  ((e)&(1<<11)?-((e)&0x7ff):((e)&0x7ff))
+#define INTEXTRA_GET_STEP(e) (((e)>>24)&0x7fU)
+#define INTEXTRA_GET_MAX(e)  ((e)&(1<<23)?-(0x800-(((e)>>12)&0x7ff)):(((e)>>12)&0x7ff))
+#define INTEXTRA_GET_MIN(e)  ((e)&(1<<11)?-(0x800-((e)&0x7ff)):((e)&0x7ff))
+#define INTEXTRA_GET_UMAX(e) (((e)>>12)&0xfff)
+#define INTEXTRA_GET_UMIN(e) ((e)&0xfff)
 
 /*
  * Property definition
@@ -115,7 +118,7 @@ typedef struct property {
   } def;
 
   /* Extended options */
-  uint32_t    (*get_opts) (void *ptr);
+  uint32_t    (*get_opts) (void *ptr, uint32_t opts);
 
   /* Documentation callback */
   char       *(*doc) ( const struct property *prop, const char *lang );
@@ -127,7 +130,8 @@ typedef struct property {
 
 #define PROP_SBUF_LEN 4096
 extern char prop_sbuf[PROP_SBUF_LEN];
-extern char *prop_sbuf_ptr;
+extern const char *prop_sbuf_ptr;
+extern const char *prop_ptr;
 
 const property_t *prop_find(const property_t *p, const char *name);
 
@@ -159,6 +163,9 @@ static char * \
 prop_doc_##name(const struct property *p, const char *lang) \
 { return prop_md_doc(tvh_doc_##name##_property, lang); }
 
+
+/* helpers */
+htsmsg_t *proplib_kill_list ( void *o, const char *lang );
 
 #endif /* __TVH_PROP_H__ */
 

@@ -16,21 +16,9 @@
  *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <pthread.h>
-#include <ctype.h>
-#include <assert.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdarg.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-
 #include "tvheadend.h"
+#include <ctype.h>
+#include <arpa/inet.h>
 #include "config.h"
 #include "access.h"
 #include "settings.h"
@@ -38,8 +26,6 @@
 #include "dvr/dvr.h"
 #include "tcp.h"
 #include "lang_codes.h"
-
-#define TICKET_LIFETIME (5*60) /* in seconds */
 
 struct access_entry_queue access_entries;
 struct access_ticket_queue access_tickets;
@@ -51,7 +37,7 @@ const char *superuser_password;
 
 int access_noacl;
 
-static int passwd_verify(const char *username, verify_callback_t verify, void *aux);
+static int passwd_verify(access_t *a, const char *username, verify_callback_t verify, void *aux);
 static int passwd_verify2(const char *username, verify_callback_t verify, void *aux,
                           const char *username2, const char *passwd2);
 static void access_ticket_destroy(access_ticket_t *at);
@@ -100,7 +86,7 @@ access_ticket_find(const char *id)
     /* assume that newer tickets are hit more probably */
     TAILQ_FOREACH_REVERSE(at, &access_tickets, access_ticket_queue, at_link)
       if(!strcmp(at->at_id, id))
-	return at;
+        return at;
   }
   
   return NULL;
@@ -124,12 +110,11 @@ access_ticket_timeout(void *aux)
 const char *
 access_ticket_create(const char *resource, access_t *a)
 {
-  const int64_t lifetime = sec2mono(TICKET_LIFETIME);
+  const int64_t lifetime = sec2mono(MINMAX(config.ticket_expires, 30, 3600));
   uint8_t buf[20];
   char id[41];
   uint_fast32_t i;
   access_ticket_t *at;
-  static const char hex_string[16] = "0123456789ABCDEF";
 
   assert(a);
 
@@ -143,17 +128,10 @@ access_ticket_create(const char *resource, access_t *a)
       return at->at_id;
   }
 
-
   at = calloc(1, sizeof(access_ticket_t));
 
-  uuid_random(buf, 20);
-
-  //convert to hexstring
-  for (i=0; i < sizeof(buf); i++){
-    id[i*2] = hex_string[((buf[i] >> 4) & 0xF)];
-    id[(i*2)+1] = hex_string[(buf[i]) & 0x0F];
-  }
-  id[40] = '\0';
+  uuid_random(buf, sizeof(buf));
+  bin2hex(id, sizeof(id), buf, sizeof(buf));
 
   at->at_id = strdup(id);
   at->at_resource = strdup(resource);
@@ -161,7 +139,7 @@ access_ticket_create(const char *resource, access_t *a)
   at->at_access = access_copy(a);
   at->at_timer.mti_expire = mclk() + lifetime;
 
-  i = TAILQ_FIRST(&access_tickets) != NULL;
+  i = TAILQ_EMPTY(&access_tickets);
 
   TAILQ_INSERT_TAIL(&access_tickets, at, at_link);
 
@@ -211,6 +189,42 @@ access_ticket_verify2(const char *id, const char *resource)
     return NULL;
 
   return access_copy(at->at_access);
+}
+
+/**
+ *
+ */
+static int
+passwd_auth_exists(const char *id)
+{
+  passwd_entry_t *pw;
+
+  if (id == NULL)
+    return 0;
+  TAILQ_FOREACH(pw, &passwd_entries, pw_link) {
+    if (strempty(pw->pw_auth)) continue;
+    if (strcmp(id, pw->pw_auth) == 0) return 1;
+  }
+  return 0;
+}
+
+/**
+ *
+ */
+static passwd_entry_t *
+passwd_auth_find(const char *id)
+{
+  passwd_entry_t *pw;
+
+  if (id == NULL)
+    return NULL;
+  TAILQ_FOREACH(pw, &passwd_entries, pw_link) {
+    if (!pw->pw_enabled) continue;
+    if (!pw->pw_auth_enabled) continue;
+    if (strempty(pw->pw_auth)) continue;
+    if (strcmp(id, pw->pw_auth) == 0) return pw;
+  }
+  return NULL;
 }
 
 /**
@@ -273,7 +287,11 @@ access_copy(access_t *src)
       memcpy(dst->aa_chrange, src->aa_chrange, l);
   }
   if (src->aa_chtags)
-    dst->aa_chtags  = htsmsg_copy(src->aa_chtags);
+    dst->aa_chtags = htsmsg_copy(src->aa_chtags);
+  if (src->aa_chtags_exclude)
+    dst->aa_chtags_exclude = htsmsg_copy(src->aa_chtags_exclude);
+  if (src->aa_auth)
+    dst->aa_auth = strdup(src->aa_auth);
   return dst;
 }
 
@@ -300,10 +318,10 @@ access_get_theme(access_t *a)
 {
   if (a == NULL)
     return "blue";
-  if (a->aa_theme == NULL || a->aa_theme[0] == '\0') {
-    if (config.theme_ui == NULL || config.theme_ui[0] == '\0')
+  if (tvh_str_default(a->aa_theme, NULL) == NULL) {
+    if (tvh_str_default(config.theme_ui, NULL) == NULL)
       return "blue";
-     return config.theme_ui;
+    return config.theme_ui;
   }
   return a->aa_theme;
 }
@@ -321,9 +339,12 @@ access_destroy(access_t *a)
   free(a->aa_lang);
   free(a->aa_lang_ui);
   free(a->aa_theme);
+  free(a->aa_chrange);
+  free(a->aa_auth);
   htsmsg_destroy(a->aa_profiles);
   htsmsg_destroy(a->aa_dvrcfgs);
   htsmsg_destroy(a->aa_chtags);
+  htsmsg_destroy(a->aa_chtags_exclude);
   free(a);
 }
 
@@ -413,6 +434,32 @@ access_ip_blocked(struct sockaddr_storage *src)
  *
  */
 static void
+access_dump_tags
+  (const char *prefix, char *buf, size_t buflen, size_t *_l, htsmsg_t *tags)
+{
+  size_t l = *_l;
+  if (tags) {
+    int first = 1;
+    htsmsg_field_t *f;
+    HTSMSG_FOREACH(f, tags) {
+      channel_tag_t *ct = channel_tag_find_by_uuid(htsmsg_field_get_str(f) ?: "");
+      if (ct) {
+        if (first)
+          tvh_strlcatf(buf, sizeof(buf), l, ", %s tags=", prefix);
+        tvh_strlcatf(buf, sizeof(buf), l, "%s'%s'", first ? "" : ",", ct->ct_name ?: "");
+        first = 0;
+      }
+    }
+  } else {
+    tvh_strlcatf(buf, sizeof(buf), l, ", %s tag=ANY", prefix);
+  }
+  *_l = l;
+}
+
+/*
+ *
+ */
+static void
 access_dump_a(access_t *a)
 {
   htsmsg_field_t *f;
@@ -480,19 +527,9 @@ access_dump_a(access_t *a)
                    (long long)a->aa_chrange[first+1]);
   }
 
-  if (a->aa_chtags) {
-    first = 1;
-    HTSMSG_FOREACH(f, a->aa_chtags) {
-      channel_tag_t *ct = channel_tag_find_by_uuid(htsmsg_field_get_str(f) ?: "");
-      if (ct) {
-        tvh_strlcatf(buf, sizeof(buf), l, "%s'%s'",
-                 first ? ", tags=" : ",", ct->ct_name ?: "");
-        first = 0;
-      }
-    }
-  } else {
-    tvh_strlcatf(buf, sizeof(buf), l, ", tag=ANY");
-  }
+
+  access_dump_tags("exclude ", buf, sizeof(buf), &l, a->aa_chtags_exclude);
+  access_dump_tags("", buf, sizeof(buf), &l, a->aa_chtags);
 
   tvhtrace(LS_ACCESS, "%s", buf);
 }
@@ -592,32 +629,26 @@ access_update(access_t *a, access_entry_t *ae)
   }
 
   if (ae->ae_change_chtags) {
-    if (ae->ae_chtags_exclude && !LIST_EMPTY(&ae->ae_chtags)) {
-      channel_tag_t *ct;
-      TAILQ_FOREACH(ct, &channel_tags, ct_link) {
-        if(ct && ct->ct_name[0] != '\0') {
-          LIST_FOREACH(ilm, &ae->ae_chtags, ilm_in1_link) {
-            channel_tag_t *ct2 = (channel_tag_t *)ilm->ilm_in2;
-            if (ct == ct2) break;
-          }
-          if (ilm == NULL) {
-            if (a->aa_chtags == NULL)
-              a->aa_chtags = htsmsg_create_list();
-            htsmsg_add_str_exclusive(a->aa_chtags, idnode_uuid_as_str(&ct->ct_id, ubuf));
-          }
-        }
-      }
+    if (LIST_EMPTY(&ae->ae_chtags)) {
+      idnode_list_destroy(&ae->ae_chtags, ae);
     } else {
-      if (LIST_EMPTY(&ae->ae_chtags)) {
-        idnode_list_destroy(&ae->ae_chtags, ae);
-      } else {
-        LIST_FOREACH(ilm, &ae->ae_chtags, ilm_in1_link) {
-          channel_tag_t *ct = (channel_tag_t *)ilm->ilm_in2;
-          if(ct && ct->ct_name[0] != '\0') {
-            if (a->aa_chtags == NULL)
-              a->aa_chtags = htsmsg_create_list();
-            htsmsg_add_str_exclusive(a->aa_chtags, idnode_uuid_as_str(&ct->ct_id, ubuf));
+      htsmsg_t **lst, *lst2;
+      LIST_FOREACH(ilm, &ae->ae_chtags, ilm_in1_link) {
+        channel_tag_t *ct = (channel_tag_t *)ilm->ilm_in2;
+        if(ct && ct->ct_name[0] != '\0') {
+          const char *ct_uuid = idnode_uuid_as_str(&ct->ct_id, ubuf);
+          if (ae->ae_chtags_exclude) {
+            lst = &a->aa_chtags_exclude;
+            lst2 = a->aa_chtags;
+          } else {
+            lst = &a->aa_chtags;
+            lst2 = a->aa_chtags_exclude;
           }
+          /* remove the tag from the accepted or exclude list */
+          htsmsg_remove_string_from_list(lst2, ct_uuid);
+          if (*lst == NULL)
+            *lst = htsmsg_create_list();
+          htsmsg_add_str_exclusive(*lst, ct_uuid);
         }
       }
     }
@@ -684,20 +715,22 @@ access_get(struct sockaddr_storage *src, const char *username, verify_callback_t
 {
   access_t *a = access_alloc();
   access_entry_t *ae;
-  int nouser = username == NULL || username[0] == '\0';
+  int nouser = tvh_str_default(username, NULL) == NULL;
+  char *s;
 
   if (!access_noacl && access_ip_blocked(src))
     return a;
 
-  if (!passwd_verify(username, verify, aux)) {
+  if (!passwd_verify(a, username, verify, aux)) {
     a->aa_username = strdup(username);
     a->aa_representative = strdup(username);
     if(!passwd_verify2(username, verify, aux,
                        superuser_username, superuser_password))
       return access_full(a);
   } else {
-    a->aa_representative = malloc(50);
-    tcp_get_str_from_ip(src, a->aa_representative, 50);
+    s = alloca(50);
+    tcp_get_str_from_ip(src, s, 50);
+    a->aa_representative = strdup(s);
     if(!passwd_verify2(username, verify, aux,
                        superuser_username, superuser_password))
       return access_full(a);
@@ -715,7 +748,7 @@ access_get(struct sockaddr_storage *src, const char *username, verify_callback_t
     if(ae->ae_username[0] != '*') {
       /* acl entry requires username to match */
       if(username == NULL || strcmp(username, ae->ae_username))
-	continue; /* Didn't get one */
+        continue; /* Didn't get one */
     }
 
     if(!netmask_verify(&ae->ae_ipmasks, src))
@@ -784,9 +817,10 @@ access_get_by_addr(struct sockaddr_storage *src)
 {
   access_t *a = access_alloc();
   access_entry_t *ae;
+  char buf[50];
 
-  a->aa_representative = malloc(50);
-  tcp_get_str_from_ip(src, a->aa_representative, 50);
+  tcp_get_str_from_ip(src, buf, sizeof(buf));
+  a->aa_representative = strdup(buf);
 
   if(access_noacl)
     return access_full(a);
@@ -810,6 +844,33 @@ access_get_by_addr(struct sockaddr_storage *src)
 
   access_set_lang_ui(a);
 
+  return a;
+}
+
+/**
+ *
+ */
+static int
+access_get_by_auth_verify(void *aux, const char *passwd)
+{
+  if (passwd == superuser_password)
+    return 0;
+  return 1;
+}
+
+/**
+ *
+ */
+access_t *
+access_get_by_auth(struct sockaddr_storage *src, const char *id)
+{
+  access_t *a;
+  passwd_entry_t *pw = passwd_auth_find(id);
+  if (!pw)
+    return NULL;
+  a = access_get(src, pw->pw_username, access_get_by_auth_verify, NULL);
+  a->aa_rights &= ACCESS_ADVANCED_STREAMING|ACCESS_STREAMING;
+  tvh_str_set(&a->aa_auth, id);
   return a;
 }
 
@@ -891,8 +952,7 @@ access_set_prefix(struct access_ipmask_queue *ais, const char *prefix, int dflt)
     free(ai);
   }
 
-  strncpy(tokbuf, prefix, sizeof(tokbuf)-1);
-  tokbuf[sizeof(tokbuf) - 1] = 0;
+  strlcpy(tokbuf, prefix, sizeof(tokbuf));
   tok = strtok_r(tokbuf, delim, &saveptr);
 
   while (tok != NULL) {
@@ -1176,7 +1236,8 @@ access_entry_class_save(idnode_t *self, char *filename, size_t fsize)
   htsmsg_t *c = htsmsg_create_map();
   access_entry_update_rights((access_entry_t *)self);
   idnode_save(&ae->ae_id, c);
-  snprintf(filename, fsize, "accesscontrol/%s", idnode_uuid_as_str(&ae->ae_id, ubuf));
+  if (filename)
+    snprintf(filename, fsize, "accesscontrol/%s", idnode_uuid_as_str(&ae->ae_id, ubuf));
   return c;
 }
 
@@ -1211,23 +1272,25 @@ access_entry_class_movedown(idnode_t *self)
   }
 }
 
-static const char *
-access_entry_class_get_title (idnode_t *self, const char *lang)
+static void
+access_entry_class_get_title
+  (idnode_t *self, const char *lang, char *buf, size_t dstsize)
 {
   access_entry_t *ae = (access_entry_t *)self;
-  const char *s = ae->ae_username;
 
   if (ae->ae_comment && ae->ae_comment[0] != '\0') {
     if (ae->ae_username && ae->ae_username[0]) {
-      snprintf(prop_sbuf, PROP_SBUF_LEN, "%s (%s)", ae->ae_username, ae->ae_comment);
-      s = prop_sbuf;
+      snprintf(buf, dstsize, "%s (%s)", ae->ae_username, ae->ae_comment);
+      return;
     } else {
-      s = ae->ae_comment;
+      snprintf(buf, dstsize, "%s", ae->ae_comment);
+      return;
     }
   }
-  if (s == NULL || *s == '\0')
-    s = "";
-  return s;
+  if (ae->ae_username && ae->ae_username[0] != '\0')
+    snprintf(buf, dstsize, "%s", ae->ae_username);
+  else
+    buf[0] = '\0';
 }
 
 static int
@@ -1240,9 +1303,8 @@ access_entry_class_prefix_set(void *o, const void *v)
 static const void *
 access_entry_class_prefix_get(void *o)
 {
-  static const char *ret;
-  ret = access_get_prefix(&((access_entry_t *)o)->ae_ipmasks);
-  return &ret;
+  prop_ptr = access_get_prefix(&((access_entry_t *)o)->ae_ipmasks);
+  return &prop_ptr;
 }
 
 static int
@@ -1883,16 +1945,50 @@ passwd_verify2
 
 static int
 passwd_verify
-  (const char *username, verify_callback_t verify, void *aux)
+  (access_t *a, const char *username, verify_callback_t verify, void *aux)
 {
   passwd_entry_t *pw;
 
   TAILQ_FOREACH(pw, &passwd_entries, pw_link)
     if (pw->pw_enabled &&
         !passwd_verify2(username, verify, aux,
-                        pw->pw_username, pw->pw_password))
+                        pw->pw_username, pw->pw_password)) {
+      if (pw->pw_auth_enabled)
+        tvh_str_set(&a->aa_auth, pw->pw_auth);
       return 0;
+    }
   return -1;
+}
+
+static void
+passwd_entry_new_auth(passwd_entry_t *pw)
+{
+  static const char table[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-.";
+  uint8_t buf[20], *in;
+  char id[42], *dst;
+  unsigned int bits;
+  int len, shift;
+
+  do {
+    id[0] = 'P';
+    uuid_random(in = buf, sizeof(buf));
+    /* convert random bits to URL safe characters, modified base64 encoding */
+    bits = 0;
+    shift = 0;
+    in = buf;
+    dst = id + 1;
+    for (len = sizeof(buf); len > 0; len--) {
+      bits = (bits << 8) + *in++;
+      shift += 8;
+      do {
+        *dst++ = table[(bits << 6 >> shift) & 0x3f];
+        shift -= 6;
+      } while (shift > 6 || (len == 1 && shift > 0));
+    }
+    *dst = '\0';
+  } while (passwd_auth_exists(id));
+  tvh_str_set(&pw->pw_auth, id);
 }
 
 passwd_entry_t *
@@ -1942,6 +2038,7 @@ passwd_entry_destroy(passwd_entry_t *pw, int delconf)
   free(pw->pw_username);
   free(pw->pw_password);
   free(pw->pw_password2);
+  free(pw->pw_auth);
   free(pw->pw_comment);
   free(pw);
 }
@@ -1953,7 +2050,8 @@ passwd_entry_class_save(idnode_t *self, char *filename, size_t fsize)
   char ubuf[UUID_HEX_SIZE];
   htsmsg_t *c = htsmsg_create_map();
   idnode_save(&pw->pw_id, c);
-  snprintf(filename, fsize, "passwd/%s", idnode_uuid_as_str(&pw->pw_id, ubuf));
+  if (filename)
+    snprintf(filename, fsize, "passwd/%s", idnode_uuid_as_str(&pw->pw_id, ubuf));
   return c;
 }
 
@@ -1964,14 +2062,17 @@ passwd_entry_class_delete(idnode_t *self)
   passwd_entry_destroy(pw, 1);
 }
 
-static const char *
-passwd_entry_class_get_title (idnode_t *self, const char *lang)
+static void
+passwd_entry_class_get_title
+  (idnode_t *self, const char *lang, char *dst, size_t dstsize)
 {
   passwd_entry_t *pw = (passwd_entry_t *)self;
 
-  if (pw->pw_comment && pw->pw_comment[0] != '\0')
-    return pw->pw_comment;
-  return pw->pw_username ?: "";
+  if (pw->pw_comment && pw->pw_comment[0] != '\0') {
+    snprintf(dst, dstsize, "%s", pw->pw_comment);
+  } else {
+    snprintf(dst, dstsize, "%s", pw->pw_username ?: "");
+  }
 }
 
 static int
@@ -2015,7 +2116,73 @@ passwd_entry_class_password2_set(void *o, const void *v)
   return 0;
 }
 
+static int
+passwd_entry_class_auth_enabled_set ( void *obj, idnode_slist_t *entry, int val )
+{
+  passwd_entry_t *pw = (passwd_entry_t *)obj;
+  val = !!val;
+  if (pw->pw_auth_enabled != val) {
+    pw->pw_auth_enabled = val;
+    if (val && strempty(pw->pw_auth))
+      passwd_entry_new_auth((passwd_entry_t *)obj);
+    return 1;
+  }
+  return 0;
+}
+
+static int
+passwd_entry_class_auth_reset_set ( void *obj, idnode_slist_t *entry, int val )
+{
+  if (val) {
+    passwd_entry_new_auth((passwd_entry_t *)obj);
+    return 1;
+  }
+  return 0;
+}
+
+static idnode_slist_t passwd_entry_class_auth_slist[] = {
+  {
+    .id   = "enable",
+    .name = N_("Enable"),
+    .off  = offsetof(passwd_entry_t, pw_auth_enabled),
+    .set  = passwd_entry_class_auth_enabled_set,
+  },
+  {
+    .id   = "reset",
+    .name = N_("Reset"),
+    .off  = 0,
+    .set  = passwd_entry_class_auth_reset_set,
+  },
+  {}
+};
+
+static htsmsg_t *
+passwd_entry_class_auth_enum ( void *obj, const char *lang )
+{
+  return idnode_slist_enum(obj, passwd_entry_class_auth_slist, lang);
+}
+
+static const void *
+passwd_entry_class_auth_get ( void *obj )
+{
+  return idnode_slist_get(obj, passwd_entry_class_auth_slist);
+}
+
+static char *
+passwd_entry_class_auth_rend ( void *obj, const char *lang )
+{
+  return idnode_slist_rend(obj, passwd_entry_class_auth_slist, lang);
+}
+
+static int
+passwd_entry_class_auth_set ( void *obj, const void *p )
+{
+  return idnode_slist_set(obj, passwd_entry_class_auth_slist, p);
+}
+
 CLASS_DOC(passwd)
+PROP_DOC(auth)
+PROP_DOC(authcode)
 
 const idclass_t passwd_entry_class = {
   .ic_class      = "passwd",
@@ -2059,6 +2226,28 @@ const idclass_t passwd_entry_class = {
       .off      = offsetof(passwd_entry_t, pw_password2),
       .opts     = PO_PASSWORD | PO_HIDDEN | PO_EXPERT | PO_WRONCE | PO_NOUI,
       .set      = passwd_entry_class_password2_set,
+    },
+    {
+      .type     = PT_INT,
+      .islist   = 1,
+      .id       = "auth",
+      .name     = N_("Persistent authentication"),
+      .desc     = N_("Manage persistent authentication for HTTP streaming."),
+      .doc      = prop_doc_auth,
+      .list     = passwd_entry_class_auth_enum,
+      .get      = passwd_entry_class_auth_get,
+      .set      = passwd_entry_class_auth_set,
+      .rend     = passwd_entry_class_auth_rend,
+      .opts     = PO_DOC_NLIST,
+    },
+    {
+      .type     = PT_STR,
+      .id       = "authcode",
+      .name     = N_("Persistent authentication code"),
+      .desc     = N_("The code which may be used for HTTP streaming."),
+      .doc      = prop_doc_authcode,
+      .off      = offsetof(passwd_entry_t, pw_auth),
+      .opts     = PO_RDONLY,
     },
     {
       .type     = PT_STR,
@@ -2129,18 +2318,21 @@ ipblock_entry_class_save(idnode_t *self, char *filename, size_t fsize)
   htsmsg_t *c = htsmsg_create_map();
   char ubuf[UUID_HEX_SIZE];
   idnode_save(&ib->ib_id, c);
-  snprintf(filename, fsize, "ipblock/%s", idnode_uuid_as_str(&ib->ib_id, ubuf));
+  if (filename)
+    snprintf(filename, fsize, "ipblock/%s", idnode_uuid_as_str(&ib->ib_id, ubuf));
   return c;
 }
 
-static const char *
-ipblock_entry_class_get_title (idnode_t *self, const char *lang)
+static void
+ipblock_entry_class_get_title
+  (idnode_t *self, const char *lang, char *dst, size_t dstsize)
 {
   ipblock_entry_t *ib = (ipblock_entry_t *)self;
 
   if (ib->ib_comment && ib->ib_comment[0] != '\0')
-    return ib->ib_comment;
-  return N_("IP blocking");
+    snprintf(dst, dstsize, "%s", ib->ib_comment);
+  else
+    snprintf(dst, dstsize, "%s", tvh_gettext_lang(lang, N_("IP blocking")));
 }
 
 static void
@@ -2163,9 +2355,8 @@ ipblock_entry_class_prefix_set(void *o, const void *v)
 static const void *
 ipblock_entry_class_prefix_get(void *o)
 {
-  static const char *ret;
-  ret = access_get_prefix(&((ipblock_entry_t *)o)->ib_ipmasks);
-  return &ret;
+  prop_ptr = access_get_prefix(&((ipblock_entry_t *)o)->ib_ipmasks);
+  return &prop_ptr;
 }
 
 CLASS_DOC(ipblocking)
@@ -2235,7 +2426,7 @@ access_init(int createdefault, int noacl)
   if ((c = hts_settings_load("ipblock")) != NULL) {
     HTSMSG_FOREACH(f, c) {
       if (!(m = htsmsg_field_get_map(f))) continue;
-      (void)ipblock_entry_create(f->hmf_name, m);
+      (void)ipblock_entry_create(htsmsg_field_name(f), m);
     }
     htsmsg_destroy(c);
   }
@@ -2244,7 +2435,7 @@ access_init(int createdefault, int noacl)
   if ((c = hts_settings_load("passwd")) != NULL) {
     HTSMSG_FOREACH(f, c) {
       if (!(m = htsmsg_field_get_map(f))) continue;
-      (void)passwd_entry_create(f->hmf_name, m);
+      (void)passwd_entry_create(htsmsg_field_name(f), m);
     }
     htsmsg_destroy(c);
   }
@@ -2253,7 +2444,7 @@ access_init(int createdefault, int noacl)
   if ((c = hts_settings_load("accesscontrol")) != NULL) {
     HTSMSG_FOREACH(f, c) {
       if (!(m = htsmsg_field_get_map(f))) continue;
-      (void)access_entry_create(f->hmf_name, m);
+      (void)access_entry_create(htsmsg_field_name(f), m);
     }
     htsmsg_destroy(c);
     access_entry_reindex();
@@ -2307,7 +2498,7 @@ access_done(void)
   passwd_entry_t *pw;
   ipblock_entry_t *ib;
 
-  pthread_mutex_lock(&global_lock);
+  tvh_mutex_lock(&global_lock);
   while ((ae = TAILQ_FIRST(&access_entries)) != NULL)
     access_entry_destroy(ae, 0);
   while ((at = TAILQ_FIRST(&access_tickets)) != NULL)
@@ -2320,5 +2511,5 @@ access_done(void)
   superuser_username = NULL;
   free((void *)superuser_password);
   superuser_password = NULL;
-  pthread_mutex_unlock(&global_lock);
+  tvh_mutex_unlock(&global_lock);
 }

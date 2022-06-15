@@ -21,8 +21,6 @@
 #include "input.h"
 #include "dvb.h"
 
-SKEL_DECLARE(mpegts_psi_table_state_skel, struct mpegts_psi_table_state);
-
 /* **************************************************************************
  * Lookup tables
  * *************************************************************************/
@@ -79,14 +77,29 @@ mpegts_psi_section_reassemble0
   uint8_t *p = mt->mt_sect.ps_data;
   int excess, tsize;
 
+  if(len <= 0)
+    return -1;
+
   if(start) {
-    // Payload unit start indicator
+    /* Payload unit start indicator */
     mt->mt_sect.ps_offset = 0;
     mt->mt_sect.ps_lock = 1;
+    if((data[0] & mt->mt_sect.ps_mask) != mt->mt_sect.ps_table) {
+      if(len >= 3) {
+        tsize = 3 + (((data[1] & 0xf) << 8) | data[2]);
+        if(len >= tsize)
+          return tsize;
+      }
+    }
   }
 
   if(!mt->mt_sect.ps_lock)
     return -1;
+
+  if(mt->mt_sect.ps_offset + len > MPEGTS_PSI_SECTION_SIZE) {
+    tvherror(mt->mt_subsys, "PSI section overflow");
+    return -1;
+  }
 
   memcpy(p + mt->mt_sect.ps_offset, data, len);
   mt->mt_sect.ps_offset += len;
@@ -102,13 +115,14 @@ mpegts_psi_section_reassemble0
     return len; // Not there yet
 
   if(p[0] == 0x72) { /* stuffing section */
-    dvb_table_reset(mt);
     cb = NULL;
     crc = 0;
+  } else if((p[0] & mt->mt_sect.ps_mask) != mt->mt_sect.ps_table) {
+    cb = NULL;
   }
 
   if(crc && tvh_crc32(p, tsize, 0xffffffff)) {
-    if (tvhlog_limit(&mt->mt_err_log, 10)) {
+    if (cb && tvhlog_limit(&mt->mt_err_log, 10)) {
       tvhwarn(mt->mt_subsys, "%s: %s: invalid checksum (len %i, errors %zi)",
               mt->mt_name, logpref, tsize, mt->mt_err_log.count);
     }
@@ -116,7 +130,6 @@ mpegts_psi_section_reassemble0
   }
 
   excess = mt->mt_sect.ps_offset - tsize;
-  mt->mt_sect.ps_offset = 0;
 
   if (cb)
     cb(p, tsize - (crc ? 4 : 0), opaque);
@@ -154,27 +167,31 @@ mpegts_psi_section_reassemble
   }
 
   if(pusi) {
-    int len = tsb[off++];
-    if(len > 0) {
-      if(len > 188 - off) {
-        mt->mt_sect.ps_lock = 0;
-        return;
-      }
-      mpegts_psi_section_reassemble0(mt, logprefix, tsb + off, len, 0, crc, cb, opaque);
-      off += len;
+    uint8_t len2 = tsb[off++];
+    uint8_t off2 = off;
+    off += len2;
+    if (off > 188)
+      goto wrong_state;
+    while (off2 < len2) {
+      r = mpegts_psi_section_reassemble0(mt, logprefix, tsb + off2, len2, 0, crc, cb, opaque);
+      if (r < 0)
+        goto wrong_state;
+      off2 += r;
+      len2 -= r;
     }
   }
 
   while(off < 188) {
     r = mpegts_psi_section_reassemble0(mt, logprefix, tsb + off, 188 - off, pusi, crc,
         cb, opaque);
-    if(r < 0) {
-      mt->mt_sect.ps_lock = 0;
-      break;
-    }
+    if (r < 0)
+      goto wrong_state;
     off += r;
-    pusi = 0;
   }
+  return;
+
+wrong_state:
+  mt->mt_sect.ps_lock = 0;
 }
 
 /*
@@ -200,30 +217,45 @@ mpegts_table_state_reset
   int i;
   mt->mt_finished = 0;
   st->complete = 0;
-  st->version = 0xff;  /* invalid */
+  st->version = MPEGTS_PSI_VERSION_NONE;
+  st->last = last;
   memset(st->sections, 0, sizeof(st->sections));
   for (i = 0; i < last / 32; i++)
     st->sections[i] = 0xFFFFFFFF;
   st->sections[last / 32] = 0xFFFFFFFF << (31 - (last % 32));
 }
 
+static void
+mpegts_table_state_restart
+  ( mpegts_psi_table_t *mt, mpegts_psi_table_state_t *st, int last, int ver )
+{
+  if (st->complete == 2)
+    mt->mt_complete--;
+  if (st->complete)
+    mt->mt_incomplete++;
+  mpegts_table_state_reset(mt, st, last);
+  st->version = ver;
+}
+
 static mpegts_psi_table_state_t *
 mpegts_table_state_find
   ( mpegts_psi_table_t *mt, int tableid, uint64_t extraid, int last )
 {
-  mpegts_psi_table_state_t *st;
+  mpegts_psi_table_state_t *st, *st2, st_cmp;
 
   /* Find state */
-  SKEL_ALLOC(mpegts_psi_table_state_skel);
-  mpegts_psi_table_state_skel->tableid = tableid;
-  mpegts_psi_table_state_skel->extraid = extraid;
-  st = RB_INSERT_SORTED(&mt->mt_state, mpegts_psi_table_state_skel, link, sect_cmp);
-  if (!st) {
-    st   = mpegts_psi_table_state_skel;
-    SKEL_USED(mpegts_psi_table_state_skel);
-    mt->mt_incomplete++;
-    mpegts_table_state_reset(mt, st, last);
-  }
+  st_cmp.tableid = tableid;
+  st_cmp.extraid = extraid;
+  st = RB_FIND(&mt->mt_state, &st_cmp, link, sect_cmp);
+  if (st)
+    return st;
+  st = calloc(1, sizeof(*st));
+  st->tableid = tableid;
+  st->extraid = extraid;
+  st2 = RB_INSERT_SORTED(&mt->mt_state, st, link, sect_cmp);
+  assert(st2 == NULL);
+  mt->mt_incomplete++;
+  mpegts_table_state_reset(mt, st, last);
   return st;
 }
 
@@ -284,9 +316,10 @@ int
 dvb_table_begin
   (mpegts_psi_table_t *mt, const uint8_t *ptr, int len,
    int tableid, uint64_t extraid, int minlen,
-   mpegts_psi_table_state_t **ret, int *sect, int *last, int *ver)
+   mpegts_psi_table_state_t **ret, int *sect, int *last, int *ver,
+   time_t interval)
 {
-  mpegts_psi_table_state_t *st;
+  mpegts_psi_table_state_t *st, *st2;
   uint32_t sa, sb;
 
   /* Not long enough */
@@ -321,15 +354,23 @@ dvb_table_begin
       return -1;
 #endif
 
+    /* Interval check */
+    if (interval && mt->mt_last_complete &&
+      mt->mt_last_complete + interval < gclk()) {
+      mt->mt_last_complete = 0;
+      tvhtrace(mt->mt_subsys, "%s:  time interval exceeded, complete restart", mt->mt_name);
+      RB_FOREACH(st2, &mt->mt_state, link)
+        if (st != st2)
+          mpegts_table_state_restart(mt, st2, st2->last, MPEGTS_PSI_VERSION_NONE);
+      mpegts_table_state_restart(mt, st, *last, *ver);
+    }
+
     /* New version */
-    if (st->version != *ver) {
-      if (st->complete == 2)
-        mt->mt_complete--;
-      if (st->complete)
-        mt->mt_incomplete++;
-      tvhtrace(mt->mt_subsys, "%s:  new version, restart", mt->mt_name);
-      mpegts_table_state_reset(mt, st, *last);
+    if (st->version == MPEGTS_PSI_VERSION_NONE)
       st->version = *ver;
+    if (st->version != *ver) {
+      tvhtrace(mt->mt_subsys, "%s:  new version, restart", mt->mt_name);
+      mpegts_table_state_restart(mt, st, *last, *ver);
     }
 
     /* Complete? */
@@ -354,6 +395,9 @@ dvb_table_begin
     }
   }
 
+  if (mt->mt_last_complete == 0)
+    mt->mt_last_complete = gclk();
+
   tvhlog_hexdump(mt->mt_subsys, ptr, len);
 
   return 1;
@@ -367,6 +411,7 @@ dvb_table_reset(mpegts_psi_table_t *mt)
   tvhtrace(mt->mt_subsys, "%s: pid %02X complete reset", mt->mt_name, mt->mt_pid);
   mt->mt_incomplete = 0;
   mt->mt_complete   = 0;
+  mt->mt_last_complete = 0;
   while ((st = RB_FIRST(&mt->mt_state)) != NULL) {
     RB_REMOVE(&mt->mt_state, st, link);
     free(st);
@@ -389,7 +434,8 @@ dvb_table_release(mpegts_psi_table_t *mt)
  */
 
 void dvb_table_parse_init
-  ( mpegts_psi_table_t *mt, const char *name, int subsys, int pid, void *opaque )
+  ( mpegts_psi_table_t *mt, const char *name, int subsys, int pid,
+    uint8_t table, uint8_t mask, void *opaque )
 {
   memset(mt, 0, sizeof(*mt));
   mt->mt_name = strdup(name);
@@ -397,11 +443,33 @@ void dvb_table_parse_init
   mt->mt_opaque = opaque;
   mt->mt_pid = pid;
   mt->mt_sect.ps_cc = -1;
+  mt->mt_sect.ps_table = table;
+  mt->mt_sect.ps_mask = mask;
+}
+
+void dvb_table_parse_reinit_input
+  ( mpegts_psi_table_t *mt )
+{
+  dvb_table_release(mt);
+  mt->mt_last_complete = 0;
+  mt->mt_complete = mt->mt_incomplete = 0;
+  mt->mt_finished = 0;
+  mt->mt_sect.ps_cc = -1;
+  mt->mt_sect.ps_offset = 0;
+  mt->mt_sect.ps_lock = 0;
+}
+
+void dvb_table_parse_reinit_output
+  ( mpegts_psi_table_t *mt )
+{
+  mt->mt_sect.ps_cco = 0;
 }
 
 void dvb_table_parse_done( mpegts_psi_table_t *mt )
 {
+  dvb_table_release(mt);
   free(mt->mt_name);
+  mt->mt_name = NULL;
 }
 
 struct psi_parse {

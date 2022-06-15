@@ -210,15 +210,9 @@ esfilter_class_save(idnode_t *self, char *filename, size_t fsize)
   htsmsg_t *c = htsmsg_create_map();
   char ubuf[UUID_HEX_SIZE];
   idnode_save(self, c);
-  snprintf(filename, fsize, "esfilter/%s", idnode_uuid_as_str(self, ubuf));
+  if (filename)
+    snprintf(filename, fsize, "esfilter/%s", idnode_uuid_as_str(self, ubuf));
   return c;
-}
-
-static const char *
-esfilter_class_get_title(idnode_t *self, const char *lang)
-{
-  esfilter_t *esf = (esfilter_t *)self;
-  return idnode_uuid_as_str(&esf->esf_id, prop_sbuf);
 }
 
 static void
@@ -356,8 +350,7 @@ esfilter_class_language_set(void *o, const void *v)
   const char *s = v;
   char n[4];
   int save;
-  strncpy(n, s && s[0] ? lang_code_get(s) : "", 4);
-  n[3] = 0;
+  strlcpy(n, s && s[0] ? lang_code_get(s) : "", 4);
   save = strcmp(esf->esf_language, n);
   strcpy(esf->esf_language, n);
   return save;
@@ -402,8 +395,7 @@ esfilter_class_service_set(void *o, const void *v)
   const char *s = v;
   int save = 0;
   if (strncmp(esf->esf_service, s, UUID_HEX_SIZE)) {
-    strncpy(esf->esf_service, s, UUID_HEX_SIZE);
-    esf->esf_service[UUID_HEX_SIZE-1] = '\0';
+    strlcpy(esf->esf_service, s, UUID_HEX_SIZE);
     save = 1;
   }
   return save;
@@ -450,8 +442,8 @@ esfilter_build_ca_enum(int provider)
 
   lock_assert(&global_lock);
   TAILQ_FOREACH(s, &service_all, s_all_link) {
-    pthread_mutex_lock(&s->s_stream_mutex);
-    TAILQ_FOREACH(es, &s->s_components, es_link) {
+    tvh_mutex_lock(&s->s_stream_mutex);
+    TAILQ_FOREACH(es, &s->s_components.set_all, es_link) {
       LIST_FOREACH(ca, &es->es_caids, link) {
         v = provider ? ca->providerid : ca->caid;
         for (i = 0; i < count; i++)
@@ -461,7 +453,7 @@ esfilter_build_ca_enum(int provider)
           a[count++] = v;
       }
     }
-    pthread_mutex_unlock(&s->s_stream_mutex);
+    tvh_mutex_unlock(&s->s_stream_mutex);
   }
   qsort(a, count, sizeof(uint32_t), esfilter_build_ca_cmp);
 
@@ -593,7 +585,6 @@ const idclass_t esfilter_class = {
   .ic_event      = "esfilter",
   .ic_perm_def   = ACCESS_ADMIN,
   .ic_save       = esfilter_class_save,
-  .ic_get_title  = esfilter_class_get_title,
   .ic_delete     = esfilter_class_delete,
   .ic_moveup     = esfilter_class_moveup,
   .ic_movedown   = esfilter_class_movedown,
@@ -626,7 +617,7 @@ const idclass_t esfilter_class = {
 const idclass_t esfilter_class_video = {
   .ic_super      = &esfilter_class,
   .ic_class      = "esfilter_video",
-  .ic_caption    = N_("Video Stream Filter"),
+  .ic_caption    = N_("Stream Filters - Video"),
   .ic_properties = (const property_t[]){
     {
       .type     = PT_STR,
@@ -639,6 +630,7 @@ const idclass_t esfilter_class_video = {
       .set      = esfilter_class_type_set_video,
       .list     = esfilter_class_type_enum_video,
       .rend     = esfilter_class_type_rend,
+      .opts     = PO_DOC_NLIST,
     },
     {
       .type     = PT_STR,
@@ -720,7 +712,7 @@ const idclass_t esfilter_class_video = {
 const idclass_t esfilter_class_audio = {
   .ic_super      = &esfilter_class,
   .ic_class      = "esfilter_audio",
-  .ic_caption    = N_("Audio Stream Filter"),
+  .ic_caption    = N_("Stream Filters - Audio"),
   .ic_properties = (const property_t[]){
     {
       .type     = PT_STR,
@@ -733,6 +725,7 @@ const idclass_t esfilter_class_audio = {
       .set      = esfilter_class_type_set_audio,
       .list     = esfilter_class_type_enum_audio,
       .rend     = esfilter_class_type_rend,
+      .opts     = PO_DOC_NLIST,
     },
     {
       .type     = PT_STR,
@@ -815,7 +808,7 @@ const idclass_t esfilter_class_audio = {
 const idclass_t esfilter_class_teletext = {
   .ic_super      = &esfilter_class,
   .ic_class      = "esfilter_teletext",
-  .ic_caption    = N_("Teletext Stream Filter"),
+  .ic_caption    = N_("Stream Filters - Teletext"),
   .ic_properties = (const property_t[]){
     {
       .type     = PT_STR,
@@ -828,6 +821,7 @@ const idclass_t esfilter_class_teletext = {
       .set      = esfilter_class_type_set_teletext,
       .list     = esfilter_class_type_enum_teletext,
       .rend     = esfilter_class_type_rend,
+      .opts     = PO_DOC_NLIST,
     },
     {
       .type     = PT_STR,
@@ -910,7 +904,7 @@ const idclass_t esfilter_class_teletext = {
 const idclass_t esfilter_class_subtit = {
   .ic_super      = &esfilter_class,
   .ic_class      = "esfilter_subtit",
-  .ic_caption    = N_("Subtitle Stream Filter"),
+  .ic_caption    = N_("Stream Filters - Subtitles"),
   .ic_properties = (const property_t[]){
     {
       .type     = PT_STR,
@@ -1005,7 +999,7 @@ const idclass_t esfilter_class_subtit = {
 const idclass_t esfilter_class_ca = {
   .ic_super      = &esfilter_class,
   .ic_class      = "esfilter_ca",
-  .ic_caption    = N_("CA Stream Filter"),
+  .ic_caption    = N_("Stream Filters - CA"),
   .ic_properties = (const property_t[]){
     {
       .type     = PT_STR,
@@ -1018,6 +1012,7 @@ const idclass_t esfilter_class_ca = {
       .set      = esfilter_class_type_set_ca,
       .list     = esfilter_class_type_enum_ca,
       .rend     = esfilter_class_type_rend,
+      .opts     = PO_DOC_NLIST,
     },
     {
       .type     = PT_STR,
@@ -1028,6 +1023,7 @@ const idclass_t esfilter_class_ca = {
       .get      = esfilter_class_caid_get,
       .set      = esfilter_class_caid_set,
       .list     = esfilter_class_caid_enum,
+      .opts     = PO_DOC_NLIST,
     },
     {
       .type     = PT_STR,
@@ -1038,6 +1034,7 @@ const idclass_t esfilter_class_ca = {
       .get      = esfilter_class_caprovider_get,
       .set      = esfilter_class_caprovider_set,
       .list     = esfilter_class_caprovider_enum,
+      .opts     = PO_DOC_NLIST,
     },
     {
       .type     = PT_STR,
@@ -1110,7 +1107,7 @@ const idclass_t esfilter_class_ca = {
 const idclass_t esfilter_class_other = {
   .ic_super      = &esfilter_class,
   .ic_class      = "esfilter_other",
-  .ic_caption    = N_("Other Stream Filter"),
+  .ic_caption    = N_("Stream Filters - Other"),
   .ic_properties = (const property_t[]){
     {
       .type     = PT_STR,
@@ -1123,6 +1120,7 @@ const idclass_t esfilter_class_other = {
       .set      = esfilter_class_type_set_other,
       .list     = esfilter_class_type_enum_other,
       .rend     = esfilter_class_type_rend,
+      .opts     = PO_DOC_NLIST,
     },
     {
       .type     = PT_STR,
@@ -1210,7 +1208,7 @@ esfilter_init(void)
   HTSMSG_FOREACH(f, c) {
     if (!(e = htsmsg_field_get_map(f)))
       continue;
-    esfilter_create(-1, f->hmf_name, e, 0);
+    esfilter_create(-1, htsmsg_field_name(f), e, 0);
   }
   htsmsg_destroy(c);
 
@@ -1224,10 +1222,10 @@ esfilter_done(void)
   esfilter_t *esf;
   int i;
 
-  pthread_mutex_lock(&global_lock);
+  tvh_mutex_lock(&global_lock);
   for (i = 0; i <= ESF_CLASS_LAST; i++) {
     while ((esf = TAILQ_FIRST(&esfilters[i])) != NULL)
       esfilter_delete(esf, 0);
   }
-  pthread_mutex_unlock(&global_lock);
+  tvh_mutex_unlock(&global_lock);
 }

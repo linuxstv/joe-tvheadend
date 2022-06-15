@@ -25,7 +25,6 @@
  * Class
  */
 extern const idclass_t mpegts_mux_class;
-extern const idclass_t mpegts_mux_instance_class;
 
 static inline void
 iptv_url_set0 ( char **url, char **sane_url,
@@ -41,8 +40,6 @@ int
 iptv_url_set ( char **url, char **sane_url, const char *str, int allow_file, int allow_pipe )
 {
   const char *x;
-  char *buf, port[16] = "";
-  size_t len;
   url_t u;
 
   if (strcmp(str ?: "", *url ?: "") == 0)
@@ -65,21 +62,8 @@ iptv_url_set ( char **url, char **sane_url, const char *str, int allow_file, int
     return 1;
   }
   urlinit(&u);
-  if (!urlparse(str, &u)) {
-    len = (u.scheme ? strlen(u.scheme) + 3 : 0) +
-          (u.host ? strlen(u.host) + 1 : 0) +
-          /* port */ 16 +
-          (u.path ? strlen(u.path) + 1 : 0) +
-          (u.query ? strlen(u.query) + 2 : 0);
-    buf = alloca(len);
-    if (u.port > 0 && u.port <= 65535)
-      snprintf(port, sizeof(port), ":%d", u.port);
-    snprintf(buf, len, "%s%s%s%s%s%s%s",
-             u.scheme ?: "", u.scheme ? "://" : "",
-             u.host ?: "", port,
-             u.path ?: "", (u.query && u.query[0]) ? "?" : "",
-             u.query ?: "");
-    iptv_url_set0(url, sane_url, str, buf);
+  if (!urlparse(str, &u) && !urlrecompose(&u)) {
+    iptv_url_set0(url, sane_url, u.raw, str);
     urlreset(&u);
     return 1;
   } else {
@@ -97,19 +81,18 @@ iptv_mux_url_set ( void *p, const void *v )
   return iptv_url_set(&im->mm_iptv_url, &im->mm_iptv_url_sane, v, 1, 1);
 }
 
+#if ENABLE_LIBAV
 static htsmsg_t *
-iptv_muxdvr_class_kill_list ( void *o, const char *lang )
+iptv_mux_libav_enum ( void *o, const char *lang )
 {
   static const struct strtab tab[] = {
-    { N_("SIGKILL"),   IPTV_KILL_KILL },
-    { N_("SIGTERM"),   IPTV_KILL_TERM },
-    { N_("SIGINT"),    IPTV_KILL_INT, },
-    { N_("SIGHUP"),    IPTV_KILL_HUP },
-    { N_("SIGUSR1"),   IPTV_KILL_USR1 },
-    { N_("SIGUSR2"),   IPTV_KILL_USR2 },
+    { N_("Network settings"),   0 },
+    { N_("Use"),                1 },
+    { N_("Do not use"),        -1 },
   };
   return strtab2htsmsg(tab, 1, lang);
 }
+#endif
 
 const idclass_t iptv_mux_class =
 {
@@ -142,12 +125,31 @@ const idclass_t iptv_mux_class =
       .opts     = PO_MULTILINE
     },
     {
+      .type     = PT_STR,
+      .id       = "iptv_url_cmpid",
+      .name     = N_("URL for comparison"),
+      .off      = offsetof(iptv_mux_t, mm_iptv_url_cmpid),
+      .opts     = PO_MULTILINE | PO_HIDDEN | PO_NOUI,
+    },
+    {
       .type     = PT_BOOL,
       .id       = "iptv_substitute",
       .name     = N_("Substitute formatters"),
       .off      = offsetof(iptv_mux_t, mm_iptv_substitute),
       .opts     = PO_ADVANCED
     },
+#if ENABLE_LIBAV
+    {
+      .type     = PT_INT,
+      .id       = "use_libav",
+      .name     = N_("Use A/V library"),
+      .desc     = N_("The input stream is remuxed with A/V library (libav or"
+                     " or ffmpeg) to the MPEG-TS format which is accepted by"
+                     " Tvheadend."),
+      .list     = iptv_mux_libav_enum,
+      .off      = offsetof(iptv_mux_t, mm_iptv_libav),
+    },
+#endif
     {
       .type     = PT_STR,
       .id       = "iptv_interface",
@@ -207,7 +209,7 @@ const idclass_t iptv_mux_class =
       .id       = "iptv_kill",
       .name     = N_("Kill signal (pipe)"),
       .off      = offsetof(iptv_mux_t, mm_iptv_kill),
-      .list     = iptv_muxdvr_class_kill_list,
+      .list     = proplib_kill_list,
       .opts     = PO_EXPERT
     },
     {
@@ -244,6 +246,23 @@ const idclass_t iptv_mux_class =
       .id       = "iptv_satip_dvbt_freq",
       .name     = N_("SAT>IP DVB-T frequency (Hz)"),
       .off      = offsetof(iptv_mux_t, mm_iptv_satip_dvbt_freq),
+      .desc     = N_("For example: 658000000. This frequency is 658Mhz."),
+      .opts     = PO_ADVANCED
+    },
+    {
+      .type     = PT_U32,
+      .id       = "iptv_satip_dvbc_freq",
+      .name     = N_("SAT>IP DVB-C frequency (Hz)"),
+      .off      = offsetof(iptv_mux_t, mm_iptv_satip_dvbc_freq),
+      .desc     = N_("For example: 312000000. This frequency is 312Mhz."),
+      .opts     = PO_ADVANCED
+    },
+    {
+      .type     = PT_U32,
+      .id       = "iptv_satip_dvbs_freq",
+      .name     = N_("SAT>IP DVB-S frequency (kHz)"),
+      .off      = offsetof(iptv_mux_t, mm_iptv_satip_dvbs_freq),
+      .desc     = N_("For example: 12610500. This frequency is 12610.5Mhz or 12.6105Ghz."),
       .opts     = PO_ADVANCED
     },
     {
@@ -267,10 +286,14 @@ iptv_mux_config_save ( mpegts_mux_t *mm, char *filename, size_t fsize )
   char ubuf1[UUID_HEX_SIZE];
   char ubuf2[UUID_HEX_SIZE];
   htsmsg_t *c = htsmsg_create_map();
-  mpegts_mux_save(mm, c);
-  snprintf(filename, fsize, "input/iptv/networks/%s/muxes/%s",
-           idnode_uuid_as_str(&mm->mm_network->mn_id, ubuf1),
-           idnode_uuid_as_str(&mm->mm_id, ubuf2));
+  if (filename == NULL) {
+    mpegts_mux_save(mm, c, 1);
+  } else {
+    mpegts_mux_save(mm, c, 0);
+    snprintf(filename, fsize, "input/iptv/networks/%s/muxes/%s",
+             idnode_uuid_as_str(&mm->mm_network->mn_id, ubuf1),
+             idnode_uuid_as_str(&mm->mm_id, ubuf2));
+  }
   return c;
 }
 
@@ -281,6 +304,7 @@ iptv_mux_free ( mpegts_mux_t *mm )
   free(im->mm_iptv_url);
   free(im->mm_iptv_url_sane);
   free(im->mm_iptv_url_raw);
+  free(im->mm_iptv_url_cmpid);
   free(im->mm_iptv_muxname);
   free(im->mm_iptv_interface);
   free(im->mm_iptv_svcname);
@@ -311,13 +335,12 @@ iptv_mux_display_name ( mpegts_mux_t *mm, char *buf, size_t len )
 {
   iptv_mux_t *im = (iptv_mux_t*)mm;
   if(im->mm_iptv_muxname) {
-    strncpy(buf, im->mm_iptv_muxname, len);
-    buf[len-1] = '\0';
+    strlcpy(buf, im->mm_iptv_muxname, len);
   } else if(im->mm_iptv_url_sane) {
-    strncpy(buf, im->mm_iptv_url_sane, len);
-    buf[len-1] = '\0';
-  } else
+    strlcpy(buf, im->mm_iptv_url_sane, len);
+  } else {
     *buf = 0;
+  }
 }
 
 /*
@@ -348,11 +371,6 @@ iptv_mux_create0 ( iptv_network_t *in, const char *uuid, htsmsg_t *conf )
 
   sbuf_init(&im->mm_iptv_buffer);
 
-  /* Create Instance */
-  (void)mpegts_mux_instance_create(mpegts_mux_instance, NULL,
-                                   (mpegts_input_t*)iptv_input,
-                                   (mpegts_mux_t*)im);
-
   /* Services */
   c2 = NULL;
   c = htsmsg_get_map(conf, "services");
@@ -363,7 +381,7 @@ iptv_mux_create0 ( iptv_network_t *in, const char *uuid, htsmsg_t *conf )
   if (c) {
     HTSMSG_FOREACH(f, c) {
       if (!(e = htsmsg_field_get_map(f))) continue;
-      (void)iptv_service_create0(im, 0, 0, f->hmf_name, e);
+      (void)iptv_service_create0(im, 0, 0, htsmsg_field_name(f), e);
     }
   } else if (in->in_service_id) {
     conf = htsmsg_create_map();
@@ -371,8 +389,10 @@ iptv_mux_create0 ( iptv_network_t *in, const char *uuid, htsmsg_t *conf )
     htsmsg_add_u32(conf, "dvb_servicetype", 1); /* SDTV */
     ms = iptv_service_create0(im, 0, 0, NULL, conf);
     htsmsg_destroy(conf);
-    if (ms)
-      iptv_bouquet_trigger(in, 0);
+    if (ms) {
+      ms->s_components.set_pmt_pid = SERVICE_PMT_AUTO;
+      mpegts_network_bouquet_trigger((mpegts_network_t *)in, 0);
+    }
   }
   htsmsg_destroy(c2);
 

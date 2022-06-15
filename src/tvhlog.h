@@ -19,16 +19,15 @@
 #define __TVH_LOGGING_H__
 
 #include <sys/types.h>
+#include <stdarg.h>
 #include "build.h"
 #if ENABLE_ANDROID
 #include <syslog.h>
 #else
 #include <sys/syslog.h>
 #endif
-#include <pthread.h>
-#include <stdarg.h>
-#include <time.h>
 
+#include "tvh_thread.h"
 #include "atomic.h"
 #include "clock.h"
 #include "htsmsg.h"
@@ -47,11 +46,11 @@ typedef struct {
 extern int              tvhlog_level;
 extern char            *tvhlog_path;
 extern int              tvhlog_options;
-extern pthread_mutex_t  tvhlog_mutex;
+extern tvh_mutex_t      tvhlog_mutex;
 extern tvhlog_subsys_t  tvhlog_subsystems[];
 
 /* Initialise */
-void tvhlog_init       ( int level, int options, const char *path ); 
+void tvhlog_init       ( int level, int options, const char *path );
 void tvhlog_start      ( void );
 void tvhlog_end        ( void );
 void tvhlog_set_debug  ( const char *subsys );
@@ -100,8 +99,8 @@ enum {
   LS_STOP,
   LS_CRASH,
   LS_MAIN,
-  LS_GTIMER,
-  LS_MTIMER,
+  LS_TPROF,
+  LS_QPROF,
   LS_CPU,
   LS_THREAD,
   LS_TVHPOLL,
@@ -139,6 +138,7 @@ enum {
   LS_TBL_PASS,
   LS_TBL_SATIP,
   LS_FASTSCAN,
+  LS_PCR,
   LS_PARSER,
   LS_TS,
   LS_GLOBALHEADERS,
@@ -161,8 +161,10 @@ enum {
   LS_CSA,
   LS_CAPMT,
   LS_CWC,
+  LS_CCCAM,
   LS_DVBCAM,
   LS_DVR,
+  LS_DVR_INOTIFY,
   LS_EPG,
   LS_EPGDB,
   LS_EPGGRAB,
@@ -191,6 +193,11 @@ enum {
   LS_SCANFILE,
   LS_TSFILE,
   LS_TSDEBUG,
+  LS_CODEC,
+  LS_VAAPI,
+#if ENABLE_DDCI
+  LS_DDCI,
+#endif
   LS_LAST     /* keep this last */
 };
 
@@ -230,7 +237,18 @@ static inline void tvhtrace_no_warnings(const char *fmt, ...) { (void)fmt; }
 #define tvhnotice(...) tvhlog(LOG_NOTICE,  ##__VA_ARGS__)
 #define tvherror(...)  tvhlog(LOG_ERR,     ##__VA_ARGS__)
 #define tvhalert(...)  tvhlog(LOG_ALERT,   ##__VA_ARGS__)
+#define tvhabort(...) do { \
+  tvhlog(LOG_ALERT,   ##__VA_ARGS__); \
+  tvh_safe_usleep(2000000); \
+  abort(); \
+} while (0)
 
 void tvhlog_backtrace_printf(const char *fmt, ...);
+
+#if ENABLE_TRACE
+void tvhdbg(int subsys, const char *fmt, ...);
+#else
+static inline void tvhdbg(int subsys, const char *fmt, ...) {};
+#endif
 
 #endif /* __TVH_LOGGING_H__ */

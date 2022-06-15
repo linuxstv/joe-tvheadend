@@ -62,6 +62,7 @@ void api_init               ( void );
 void api_done               ( void );
 void api_config_init        ( void );
 void api_idnode_init        ( void );
+void api_idnode_raw_init    ( void );
 void api_input_init         ( void );
 void api_service_init       ( void );
 void api_channel_init       ( void );
@@ -81,6 +82,12 @@ void api_language_init      ( void );
 void api_satip_server_init  ( void );
 void api_timeshift_init     ( void );
 void api_wizard_init        ( void );
+
+#if ENABLE_LIBAV
+void api_codec_init         ( void );
+#else
+static inline void api_codec_init(void) {};
+#endif
 
 /*
  * IDnode
@@ -114,7 +121,7 @@ int api_idnode_load_by_class
   ( access_t *perm, void *opaque, const char *op, htsmsg_t *args, htsmsg_t **resp );
 
 int api_idnode_handler
-  ( access_t *perm, htsmsg_t *args, htsmsg_t **resp,
+  ( const idclass_t *idc, access_t *perm, htsmsg_t *args, htsmsg_t **resp,
     void (*handler)(access_t *perm, idnode_t *in), const char *op, int destroyed );
 
 int api_idnode_load_simple

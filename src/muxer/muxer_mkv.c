@@ -7,7 +7,7 @@
  *  Copyright (C) 2012 John Törnblom
  *
  *  code merge, fixes, enhancements
- *  Copyright (C) 2014,2015 Jaroslav Kysela
+ *  Copyright (C) 2014,2015,2016,2017 Jaroslav Kysela
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -38,9 +38,11 @@
 #include "ebml.h"
 #include "lang_codes.h"
 #include "epg.h"
+#include "parsers/parsers.h"
 #include "parsers/parser_avc.h"
 #include "parsers/parser_hevc.h"
 #include "muxer_mkv.h"
+
 
 extern int dvr_iov_max;
 
@@ -88,7 +90,7 @@ typedef struct mk_cue {
  */
 typedef struct mk_chapter {
   TAILQ_ENTRY(mk_chapter) link;
-  int uuid;
+  uint32_t uuid;
   int64_t ts;
 } mk_chapter_t;
 
@@ -131,13 +133,26 @@ typedef struct mk_muxer {
   char *title;
 
   int webm;
+  int dvbsub_reorder;
+  int dvbsub_skip;
+
+  struct th_pktref_queue holdq;
 } mk_muxer_t;
 
 /* --- */
 
 static int mk_mux_insert_chapter(mk_muxer_t *mk);
 
-/**
+/*
+ *
+ */
+static int mk_pktref_cmp(const void *_a, const void *_b)
+{
+  const th_pktref_t *a = _a, *b = _b;
+  return a->pr_pkt->pkt_pts - b->pr_pkt->pkt_pts;
+}
+
+/*
  *
  */
 static htsbuf_queue_t *
@@ -157,35 +172,48 @@ mk_build_ebmlheader(mk_muxer_t *mk)
 
 
 /**
- *
+ * lifted from avpriv_split_xiph_headers() in libavcodec/xiph.c
  */
 static int
-mk_split_vorbis_headers(uint8_t *extradata, int extradata_size,
-			uint8_t *header_start[3],  int header_len[3])
+mk_split_xiph_headers(uint8_t *extradata, int extradata_size,
+                      int first_header_size, uint8_t *header_start[3],
+                      int header_len[3])
 {
-  int i;
-  if (extradata_size >= 3 && extradata_size < INT_MAX - 0x1ff && extradata[0] == 2) {
-    int overall_len = 3;
-    extradata++;
-    for (i=0; i<2; i++, extradata++) {
-      header_len[i] = 0;
-      for (; overall_len < extradata_size && *extradata==0xff; extradata++) {
-	header_len[i] += 0xff;
-	overall_len   += 0xff + 1;
-      }
-      header_len[i] += *extradata;
-      overall_len   += *extradata;
-      if (overall_len > extradata_size)
-	return -1;
+    int i;
+
+    if (extradata_size >= 6 && RB16(extradata) == first_header_size) {
+        int overall_len = 6;
+        for (i=0; i<3; i++) {
+            header_len[i] = RB16(extradata);
+            extradata += 2;
+            header_start[i] = extradata;
+            extradata += header_len[i];
+            if (overall_len > extradata_size - header_len[i])
+                return -1;
+            overall_len += header_len[i];
+        }
+    } else if (extradata_size >= 3 && extradata_size < INT_MAX - 0x1ff && extradata[0] == 2) {
+        int overall_len = 3;
+        extradata++;
+        for (i=0; i<2; i++, extradata++) {
+            header_len[i] = 0;
+            for (; overall_len < extradata_size && *extradata==0xff; extradata++) {
+                header_len[i] += 0xff;
+                overall_len   += 0xff + 1;
+            }
+            header_len[i] += *extradata;
+            overall_len   += *extradata;
+            if (overall_len > extradata_size)
+                return -1;
+        }
+        header_len[2] = extradata_size - overall_len;
+        header_start[0] = extradata;
+        header_start[1] = header_start[0] + header_len[0];
+        header_start[2] = header_start[1] + header_len[1];
+    } else {
+        return -1;
     }
-    header_len[2] = extradata_size - overall_len;
-    header_start[0] = extradata;
-    header_start[1] = header_start[0] + header_len[0];
-    header_start[2] = header_start[1] + header_len[1];
-  } else {
-    return -1;
-  }
-  return 0;
+    return 0;
 }
 
 
@@ -241,24 +269,24 @@ mk_build_tracks(mk_muxer_t *mk, streaming_start_t *ss)
     tr = &mk->tracks[i];
 
     tr->disabled = ssc->ssc_disabled;
-    tr->index = ssc->ssc_index;
+    tr->index = ssc->es_index;
 
     if(tr->disabled)
       continue;
 
-    tr->type = ssc->ssc_type;
-    tr->channels = ssc->ssc_channels;
-    tr->aspect_num = ssc->ssc_aspect_num;
-    tr->aspect_den = ssc->ssc_aspect_den;
+    tr->type = ssc->es_type;
+    tr->channels = ssc->es_channels;
+    tr->aspect_num = ssc->es_aspect_num;
+    tr->aspect_den = ssc->es_aspect_den;
     tr->commercial = COMMERCIAL_UNKNOWN;
-    tr->sri = ssc->ssc_sri;
+    tr->sri = ssc->es_sri;
     tr->nextpts = PTS_UNSET;
 
-    if (mk->webm && ssc->ssc_type != SCT_VP8 && ssc->ssc_type != SCT_VORBIS)
+    if (mk->webm && ssc->es_type != SCT_VP8 && ssc->es_type != SCT_VORBIS)
       tvhwarn(LS_MKV, "WEBM format supports only VP8+VORBIS streams (detected %s)",
-              streaming_component_type2txt(ssc->ssc_type));
+              streaming_component_type2txt(ssc->es_type));
 
-    switch(ssc->ssc_type) {
+    switch(ssc->es_type) {
     case SCT_MPEG2VIDEO:
       tracktype = 1;
       codec_id = "V_MPEG2";
@@ -290,12 +318,18 @@ mk_build_tracks(mk_muxer_t *mk, streaming_start_t *ss)
       mk->cluster_maxsize = 10000000;
       break;
 
+    case SCT_THEORA:
+      tracktype = 1;
+      codec_id = "V_THEORA";
+      mk->cluster_maxsize = 5242880;
+      break;
+
     case SCT_MPEG2AUDIO:
       tracktype = 2;
       codec_id  = "A_MPEG/L2";
-      if (ssc->ssc_audio_version == 3)
+      if (ssc->es_audio_version == 3)
         codec_id = "A_MPEG/L3";
-      else if (ssc->ssc_audio_version == 1)
+      else if (ssc->es_audio_version == 1)
         codec_id = "A_MPEG/L1";
       break;
 
@@ -321,7 +355,19 @@ mk_build_tracks(mk_muxer_t *mk, streaming_start_t *ss)
       codec_id = "A_VORBIS";
       break;
 
+    case SCT_OPUS:
+      tracktype = 2;
+      codec_id = "A_OPUS";
+      break;
+
+    case SCT_FLAC:
+      tracktype = 2;
+      codec_id = "A_FLAC";
+      break;
+
     case SCT_DVBSUB:
+      if (mk->dvbsub_skip)
+        goto disable;
       tracktype = 0x11;
       codec_id = "S_DVBSUB";
       break;
@@ -332,6 +378,7 @@ mk_build_tracks(mk_muxer_t *mk, streaming_start_t *ss)
       break;
 
     default:
+disable:
       ssc->ssc_muxer_disabled = 1;
       tr->disabled = 1;
       continue;
@@ -349,15 +396,16 @@ mk_build_tracks(mk_muxer_t *mk, streaming_start_t *ss)
     ebml_append_uint(t, 0x9c, 0); // Lacing
     ebml_append_string(t, 0x86, codec_id);
 
-    if(ssc->ssc_lang[0])
-      ebml_append_string(t, 0x22b59c, ssc->ssc_lang);
+    if(ssc->es_lang[0])
+      ebml_append_string(t, 0x22b59c, ssc->es_lang);
 
-    switch(ssc->ssc_type) {
+    switch(ssc->es_type) {
     case SCT_HEVC:
     case SCT_H264:
     case SCT_MPEG2VIDEO:
     case SCT_MP4A:
     case SCT_AAC:
+    case SCT_OPUS:
       if(ssc->ssc_gh) {
         sbuf_t hdr;
         sbuf_init(&hdr);
@@ -376,72 +424,71 @@ mk_build_tracks(mk_muxer_t *mk, streaming_start_t *ss)
       }
       break;
 
+    case SCT_THEORA:
     case SCT_VORBIS:
       if(ssc->ssc_gh) {
-	htsbuf_queue_t *cp;
-	uint8_t *header_start[3];
-	int header_len[3];
-	int j;
-	if(mk_split_vorbis_headers(pktbuf_ptr(ssc->ssc_gh),
-				   pktbuf_len(ssc->ssc_gh),
-				   header_start,
-				   header_len) < 0)
-	  break;
+        htsbuf_queue_t *cp;
+        uint8_t *header_start[3];
+        int header_len[3];
+        int j;
+        int first_header_size = ssc->es_type == SCT_VORBIS ? 30 : 42;
 
-	cp = htsbuf_queue_alloc(0);
-
-	ebml_append_xiph_size(cp, 2);
-
-	for (j = 0; j < 2; j++)
-	  ebml_append_xiph_size(cp, header_len[j]);
-
-	for (j = 0; j < 3; j++)
-	  htsbuf_append(cp, header_start[j], header_len[j]);
-
-	ebml_append_master(t, 0x63a2, cp);
+        if(mk_split_xiph_headers(pktbuf_ptr(ssc->ssc_gh), pktbuf_len(ssc->ssc_gh),
+                                 first_header_size, header_start, header_len)) {
+          tvherror(LS_MKV, "failed to split xiph headers");
+          break;
+        }
+        cp = htsbuf_queue_alloc(0);
+        ebml_append_xiph_size(cp, 2);
+        for (j = 0; j < 2; j++)
+          ebml_append_xiph_size(cp, header_len[j]);
+        for (j = 0; j < 3; j++)
+          htsbuf_append(cp, header_start[j], header_len[j]);
+        ebml_append_master(t, 0x63a2, cp);
       }
       break;
 
     case SCT_DVBSUB:
-      buf4[0] = ssc->ssc_composition_id >> 8;
-      buf4[1] = ssc->ssc_composition_id;
-      buf4[2] = ssc->ssc_ancillary_id >> 8;
-      buf4[3] = ssc->ssc_ancillary_id;
+      buf4[0] = ssc->es_composition_id >> 8;
+      buf4[1] = ssc->es_composition_id;
+      buf4[2] = ssc->es_ancillary_id >> 8;
+      buf4[3] = ssc->es_ancillary_id;
       ebml_append_bin(t, 0x63a2, buf4, 4);
       break;
     }
 
-    if(SCT_ISVIDEO(ssc->ssc_type)) {
+    if(SCT_ISVIDEO(ssc->es_type)) {
       htsbuf_queue_t *vi = htsbuf_queue_alloc(0);
 
-      if(ssc->ssc_frameduration) {
-        int d = ts_rescale(ssc->ssc_frameduration, 1000000000);
+      if(ssc->es_frame_duration) {
+        int d = ts_rescale(ssc->es_frame_duration, 1000000000);
         ebml_append_uint(t, 0x23e383, d);
       }
-      ebml_append_uint(vi, 0xb0, ssc->ssc_width);
-      ebml_append_uint(vi, 0xba, ssc->ssc_height);
+      ebml_append_uint(vi, 0xb0, ssc->es_width);
+      ebml_append_uint(vi, 0xba, ssc->es_height);
 
-      if(mk->webm && ssc->ssc_aspect_num && ssc->ssc_aspect_den) {
-	// DAR is not supported by webm
-	ebml_append_uint(vi, 0x54b2, 1);
-	ebml_append_uint(vi, 0x54b0, (ssc->ssc_height * ssc->ssc_aspect_num) / ssc->ssc_aspect_den);
-	ebml_append_uint(vi, 0x54ba, ssc->ssc_height);
-      } else if(ssc->ssc_aspect_num && ssc->ssc_aspect_den) {
-	ebml_append_uint(vi, 0x54b2, 3); // Display width/height is in DAR
-	ebml_append_uint(vi, 0x54b0, ssc->ssc_aspect_num);
-	ebml_append_uint(vi, 0x54ba, ssc->ssc_aspect_den);
+      if (ssc->es_aspect_num && ssc->es_aspect_den) {
+        if (mk->webm) {
+          ebml_append_uint(vi, 0x54b0, (ssc->es_height * ssc->es_aspect_num) / ssc->es_aspect_den);
+          ebml_append_uint(vi, 0x54ba, ssc->es_height);
+          ebml_append_uint(vi, 0x54b2, 0); // DisplayUnit: pixels because DAR is not supported by webm
+        } else {
+          ebml_append_uint(vi, 0x54b0, ssc->es_aspect_num);
+          ebml_append_uint(vi, 0x54ba, ssc->es_aspect_den);
+          ebml_append_uint(vi, 0x54b2, 3); // DisplayUnit: DAR
+        }
       }
 
       ebml_append_master(t, 0xe0, vi);
     }
 
-    if(SCT_ISAUDIO(ssc->ssc_type)) {
+    if(SCT_ISAUDIO(ssc->es_type)) {
       htsbuf_queue_t *au = htsbuf_queue_alloc(0);
 
-      ebml_append_float(au, 0xb5, sri_to_rate(ssc->ssc_sri));
-      if (ssc->ssc_ext_sri)
-        ebml_append_float(au, 0x78b5, sri_to_rate(ssc->ssc_ext_sri - 1));
-      ebml_append_uint(au, 0x9f, ssc->ssc_channels);
+      ebml_append_float(au, 0xb5, sri_to_rate(ssc->es_sri));
+      if (ssc->es_ext_sri)
+        ebml_append_float(au, 0x78b5, sri_to_rate(ssc->es_ext_sri - 1));
+      ebml_append_uint(au, 0x9f, ssc->es_channels);
       if (bit_depth)
         ebml_append_uint(au, 0x6264, bit_depth);
 
@@ -490,7 +537,8 @@ mk_write_to_fd(mk_muxer_t *mk, htsbuf_queue_t *hq)
     iov += iovcnt;
   } while(i);
 
-  muxer_cache_update((muxer_t *)mk, mk->fd, oldpos, 0);
+  if (mk->seekable)
+    muxer_cache_update((muxer_t *)mk, mk->fd, oldpos, 0);
 
   return 0;
 }
@@ -691,16 +739,11 @@ _mk_build_metadata(const dvr_entry_t *de, const epg_broadcast_t *ebc,
   epg_genre_t eg0;
   struct tm tm;
   time_t t;
-  epg_episode_t *ee = NULL;
-  channel_t *ch = NULL;
+  channel_t *ch = ebc ? ebc->channel : NULL;
   lang_str_t *ls = NULL, *ls2 = NULL;
-  const char **langs, *lang;
-
-  if (ebc)                     ee = ebc->episode;
-  else if (de && de->de_bcast) ee = de->de_bcast->episode;
-
-  if (de)       ch = de->de_channel;
-  else if (ebc) ch = ebc->channel;
+  const char *lang;
+  const lang_code_list_t *langs;
+  epg_episode_num_t num;
 
   if (de || ebc) {
     localtime_r(de ? &de->de_start : &ebc->start, &tm);
@@ -725,25 +768,20 @@ _mk_build_metadata(const dvr_entry_t *de, const epg_broadcast_t *ebc,
     memset(&eg0, 0, sizeof(eg0));
     eg0.code = de->de_content_type;
     eg = &eg0;
-  } else if (ee) {
-    eg = LIST_FIRST(&ee->genre);
+  } else if (ebc) {
+    eg = LIST_FIRST(&ebc->genre);
   }
   if(eg && epg_genre_get_str(eg, 1, 0, ctype, 100, NULL))
     addtag(q, build_tag_string("CONTENT_TYPE", ctype, NULL, 0, NULL));
 
   if(ch)
     addtag(q, build_tag_string("TVCHANNEL",
-                               channel_get_name(ch), NULL, 0, NULL));
+                               channel_get_name(ch, channel_blank_name), NULL, 0, NULL));
 
-  if (ee && ee->summary)
-    ls = ee->summary;
-  else if (ebc && ebc->summary)
+  if (ebc && ebc->summary)
     ls = ebc->summary;
-
   if(de && de->de_desc)
     ls2 = de->de_desc;
-  else if (ee && ee->description)
-    ls2 = ee->description;
   else if (ebc && ebc->description)
     ls2 = ebc->description;
 
@@ -762,28 +800,24 @@ _mk_build_metadata(const dvr_entry_t *de, const epg_broadcast_t *ebc,
       addtag(q, build_tag_string("DESCRIPTION", e->str, e->lang, 0, NULL));
   }
 
-  if (ee) {
-    epg_episode_num_t num;
-    epg_episode_get_epnum(ee, &num);
-    if(num.e_num)
-      addtag(q, build_tag_int("PART_NUMBER", num.e_num,
-			       0, NULL));
-    if(num.s_num)
-      addtag(q, build_tag_int("PART_NUMBER", num.s_num,
-			       60, "SEASON"));
-    if(num.p_num)
-      addtag(q, build_tag_int("PART_NUMBER", num.p_num,
-			       40, "PART"));
-    if (num.text)
-      addtag(q, build_tag_string("SYNOPSIS",
-			       num.text, NULL, 0, NULL));
-  }
+  epg_broadcast_get_epnum(ebc, &num);
+  if(num.e_num)
+    addtag(q, build_tag_int("PART_NUMBER", num.e_num,
+                              0, NULL));
+  if(num.s_num)
+    addtag(q, build_tag_int("PART_NUMBER", num.s_num,
+                              60, "SEASON"));
+  if(num.p_num)
+    addtag(q, build_tag_int("PART_NUMBER", num.p_num,
+                              40, "PART"));
+  if (num.text)
+    addtag(q, build_tag_string("SYNOPSIS",
+                               num.text, NULL, 0, NULL));
 
   if (comment) {
     lang = "eng";
-    if ((langs = lang_code_split(NULL)) && langs[0])
-      lang = tvh_strdupa(langs[0]);
-    free(langs);
+    if ((langs = lang_code_split(NULL)) != NULL)
+      lang = tvh_strdupa(langs->codes[0]->code2b);
 
     addtag(q, build_tag_string("COMMENT", comment, lang, 0, NULL));
   }
@@ -915,23 +949,9 @@ addcue(mk_muxer_t *mk, int64_t pts, int tracknum)
  *
  */
 static void
-mk_add_chapter(mk_muxer_t *mk, int64_t ts)
+mk_add_chapter0(mk_muxer_t *mk, uint32_t uuid, int64_t ts)
 {
   mk_chapter_t *ch;
-  int uuid;
-
-  ch = TAILQ_LAST(&mk->chapters, mk_chapter_queue);
-  if(ch) {
-    // don't add a new chapter if the previous one was
-    // added less than 10s ago
-    if(ts - ch->ts < 10000)
-      return;
-
-    uuid = ch->uuid + 1;
-  }
-  else {
-    uuid = 1;
-  }
 
   ch = malloc(sizeof(mk_chapter_t));
 
@@ -939,6 +959,34 @@ mk_add_chapter(mk_muxer_t *mk, int64_t ts)
   ch->ts = ts;
 
   TAILQ_INSERT_TAIL(&mk->chapters, ch, link);
+}
+
+/**
+ *
+ */
+static void
+mk_add_chapter(mk_muxer_t *mk, int64_t ts)
+{
+  mk_chapter_t *ch;
+  int uuid;
+
+  ch = TAILQ_LAST(&mk->chapters, mk_chapter_queue);
+  if(ch) {
+    /* don't add a new chapter if the previous one was added less than 5s ago */
+    if(ts - ch->ts < 5000)
+      return;
+
+    uuid = ch->uuid + 1;
+  } else {
+    uuid = 1;
+    /* create first chapter at zero position */
+    if (ts >= 5000) {
+      mk_add_chapter0(mk, uuid++, 0);
+    } else {
+      ts = 0;
+    }
+  }
+  mk_add_chapter0(mk, uuid, ts);
 }
 
 /**
@@ -962,7 +1010,8 @@ mk_write_frame_i(mk_muxer_t *mk, mk_track_t *t, th_pkt_t *pkt)
 {
   int64_t pts = pkt->pkt_pts, delta, nxt;
   unsigned char c_delta_flags[3];
-  int video = SCT_ISVIDEO(pkt->pkt_type);
+  const int video = t->tracktype == 1;
+  const int audio = t->tracktype == 2;
   int keyframe = 0, skippable = 0;
 
   if (video) {
@@ -1045,6 +1094,7 @@ mk_write_frame_i(mk_muxer_t *mk, mk_track_t *t, th_pkt_t *pkt)
 
   c_delta_flags[0] = delta >> 8;
   c_delta_flags[1] = delta;
+  if (audio && pkt->a.pkt_keyframe) keyframe = 1;
   c_delta_flags[2] = (keyframe << 7) | skippable;
   htsbuf_append(mk->cluster, c_delta_flags, 3);
   htsbuf_append(mk->cluster, data, len);
@@ -1094,7 +1144,7 @@ mk_mux_write_pkt(mk_muxer_t *mk, th_pkt_t *pkt)
 {
   int i, mark;
   mk_track_t *t = NULL;
-  th_pkt_t *opkt;
+  th_pkt_t *opkt, *tpkt;
 
   for (i = 0; i < mk->ntracks; i++) {
     t = &mk->tracks[i];
@@ -1107,8 +1157,26 @@ mk_mux_write_pkt(mk_muxer_t *mk, th_pkt_t *pkt)
     return mk->error;
   }
 
+  if (mk->dvbsub_reorder &&
+      pkt->pkt_type == SCT_DVBSUB &&
+      pts_diff(pkt->pkt_pcr, pkt->pkt_pts) > 90000) {
+    tvhtrace(LS_MKV, "insert pkt to holdq: pts %"PRId64", pcr %"PRId64", diff %"PRId64"\n", pkt->pkt_pcr, pkt->pkt_pts, pts_diff(pkt->pkt_pcr, pkt->pkt_pts));
+    pktref_enqueue_sorted(&mk->holdq, pkt, mk_pktref_cmp);
+    return mk->error;
+  }
+
   mark = 0;
   if(SCT_ISAUDIO(pkt->pkt_type)) {
+    while ((opkt = pktref_first(&mk->holdq)) != NULL) {
+      if (pts_diff(pkt->pkt_pts, opkt->pkt_pts) > 90000)
+        break;
+      opkt = pktref_get_first(&mk->holdq);
+      tvhtrace(LS_MKV, "hold push, pts %"PRId64", audio pts %"PRId64"\n", opkt->pkt_pts, pkt->pkt_pts);
+      tpkt = pkt_copy_shallow(opkt);
+      pkt_ref_dec(opkt);
+      tpkt->pkt_pcr = tpkt->pkt_pts;
+      mk_mux_write_pkt(mk, tpkt);
+    }
     if(pkt->a.pkt_channels != t->channels &&
        pkt->a.pkt_channels) {
       mark = 1;
@@ -1233,8 +1301,8 @@ mkv_muxer_mime(muxer_t* m, const struct streaming_start *ss)
     if(ssc->ssc_disabled)
       continue;
 
-    has_video |= SCT_ISVIDEO(ssc->ssc_type);
-    has_audio |= SCT_ISAUDIO(ssc->ssc_type);
+    has_video |= SCT_ISVIDEO(ssc->es_type);
+    has_audio |= SCT_ISAUDIO(ssc->es_type);
   }
 
   if(has_video)
@@ -1329,6 +1397,7 @@ mkv_muxer_open_stream(muxer_t *m, int fd)
   mk->filename = strdup("Live stream");
   mk->fd = fd;
   mk->cluster_maxsize = 0;
+  mk->totduration = 0;
 
   return 0;
 }
@@ -1365,6 +1434,7 @@ mkv_muxer_open_file(muxer_t *m, const char *filename)
   mk->fd = fd;
   mk->cluster_maxsize = 2000000;
   mk->seekable = 1;
+  mk->totduration = 0;
 
   return 0;
 }
@@ -1432,6 +1502,8 @@ mkv_muxer_close(muxer_t *m)
     return -1;
   }
 
+  pktref_clear_queue(&mk->holdq);
+
   return 0;
 }
 
@@ -1445,6 +1517,8 @@ mkv_muxer_destroy(muxer_t *m)
   mk_muxer_t *mk = (mk_muxer_t*)m;
   mk_chapter_t *ch;
 
+  pktref_clear_queue(&mk->holdq);
+
   while((ch = TAILQ_FIRST(&mk->chapters)) != NULL) {
     TAILQ_REMOVE(&mk->chapters, ch, link);
     free(ch);
@@ -1453,6 +1527,8 @@ mkv_muxer_destroy(muxer_t *m)
   free(mk->filename);
   free(mk->tracks);
   free(mk->title);
+  muxer_config_free(&mk->m_config);
+  muxer_hints_free(mk->m_hints);
   free(mk);
 }
 
@@ -1460,9 +1536,11 @@ mkv_muxer_destroy(muxer_t *m)
  * Create a new builtin muxer
  */
 muxer_t*
-mkv_muxer_create(const muxer_config_t *m_cfg)
+mkv_muxer_create(const muxer_config_t *m_cfg,
+                 const muxer_hints_t *hints)
 {
   mk_muxer_t *mk;
+  const char *agent = hints ? hints->mh_agent : NULL;
 
   if(m_cfg->m_type != MC_MATROSKA && m_cfg->m_type != MC_WEBM)
     return NULL;
@@ -1479,7 +1557,16 @@ mkv_muxer_create(const muxer_config_t *m_cfg)
   mk->m_close        = mkv_muxer_close;
   mk->m_destroy      = mkv_muxer_destroy;
   mk->webm           = m_cfg->m_type == MC_WEBM;
+  mk->dvbsub_reorder = m_cfg->u.mkv.m_dvbsub_reorder;
   mk->fd             = -1;
+
+  /*
+   * VLC has no support for MKV S_DVBSUB codec format
+   */
+  if (agent)
+    mk->dvbsub_skip  = strstr(agent, "LibVLC/") != NULL;
+
+  TAILQ_INIT(&mk->holdq);
 
   return (muxer_t*)mk;
 }

@@ -16,25 +16,25 @@
  *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <pthread.h>
 #include <ctype.h>
-#include <assert.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdarg.h>
-#include <errno.h>
-#include <math.h>
-#include <time.h>
 
 #include "tvheadend.h"
 #include "settings.h"
+#include "string_list.h"
 #include "dvr.h"
 #include "epg.h"
 #include "htsp_server.h"
 
 struct dvr_autorec_entry_queue autorec_entries;
+
+static void autorec_regfree(dvr_autorec_entry_t *dae)
+{
+  if (dae->dae_title) {
+    regex_free(&dae->dae_title_regex);
+    free(dae->dae_title);
+    dae->dae_title = NULL;
+  }
+}
 
 /*
  *
@@ -94,6 +94,60 @@ dvr_autorec_purge_spawns(dvr_autorec_entry_t *dae, int del, int disabled)
   return bcast;
 }
 
+
+/**
+ * If autorec entry no longer matches autorec rule then it can be purged.
+ * @return 1 if it can be purged
+ */
+int
+dvr_autorec_entry_can_be_purged(const dvr_entry_t *de)
+{
+  /* Not an autorec so ignore */
+  if (!de->de_autorec)
+    return 0;
+
+  /* Entry is not scheduled (for example finished) so can not be purged */
+  if (de->de_sched_state != DVR_SCHEDULED)
+    return 0;
+
+  /* No broadcast matched when entry was reloaded from dvr/log */
+  if (!de->de_bcast)
+    return 1;
+
+  /* Confirm autorec still matches the broadcast */
+  return !dvr_autorec_cmp(de->de_autorec, de->de_bcast);
+}
+
+/**
+ * Purge any dvr_entry for autorec entries that
+ * no longer match the current schedule.
+ */
+void
+dvr_autorec_purge_obsolete_timers(void)
+{
+  dvr_entry_t *de;
+  int num_purged = 0;
+
+  LIST_FOREACH(de, &dvrentries, de_global_link) {
+    if (dvr_autorec_entry_can_be_purged(de)) {
+      char ubuf[UUID_HEX_SIZE];
+      char t1buf[32], t2buf[32];
+      tvhinfo(LS_DVR, "Entry %s can be purged for \"%s\" start %s stop %s",
+              idnode_uuid_as_str(&de->de_id, ubuf),
+              lang_str_get(de->de_title, NULL),
+              gmtime2local(de->de_start, t1buf, sizeof(t1buf)),
+              gmtime2local(de->de_stop, t2buf, sizeof(t2buf)));
+
+      dvr_entry_assign_broadcast(de, NULL);
+      dvr_entry_destroy(de, 1);
+      ++num_purged;
+    }
+  }
+  if (num_purged)
+    tvhinfo(LS_DVR, "Purged %d autorec entries that no longer match schedule", num_purged);
+}
+
+
 /**
  * Handle maxcount
  */
@@ -133,15 +187,15 @@ dvr_autorec_completed(dvr_autorec_entry_t *dae, int error_code)
 /**
  * return 1 if the event 'e' is matched by the autorec rule 'dae'
  */
-static int
-autorec_cmp(dvr_autorec_entry_t *dae, epg_broadcast_t *e)
+int
+dvr_autorec_cmp(dvr_autorec_entry_t *dae, epg_broadcast_t *e)
 {
   idnode_list_mapping_t *ilm;
   dvr_config_t *cfg;
   double duration;
 
+  if (!e) return 0;
   if (!e->channel) return 0;
-  if (!e->episode) return 0;
   if(dae->dae_enabled == 0 || dae->dae_weekdays == 0)
     return 0;
 
@@ -150,58 +204,33 @@ autorec_cmp(dvr_autorec_entry_t *dae, epg_broadcast_t *e)
      dae->dae_content_type == 0 &&
      (dae->dae_title == NULL ||
      dae->dae_title[0] == '\0') &&
-     dae->dae_brand == NULL &&
-     dae->dae_season == NULL &&
+     (dae->dae_cat1 == NULL || *dae->dae_cat1 == 0) &&
+     (dae->dae_cat2 == NULL || *dae->dae_cat2 == 0) &&
+     (dae->dae_cat3 == NULL || *dae->dae_cat3 == 0) &&
      dae->dae_minduration <= 0 &&
      (dae->dae_maxduration <= 0 || dae->dae_maxduration > 24 * 3600) &&
-     dae->dae_serieslink == NULL)
+     dae->dae_minyear <= 0 &&
+     dae->dae_maxyear <= 0 &&
+     dae->dae_minseason <= 0 &&
+     dae->dae_maxseason <= 0 &&
+     dae->dae_serieslink_uri == NULL)
     return 0; // Avoid super wildcard match
 
-  // Note: we always test season first, though it will only be set
-  //       if configured
-  if(dae->dae_serieslink) {
-    if (!e->serieslink || dae->dae_serieslink != e->serieslink) return 0;
-  } else {
-    if(dae->dae_season)
-      if (!e->episode->season || dae->dae_season != e->episode->season) return 0;
-    if(dae->dae_brand)
-      if (!e->episode->brand || dae->dae_brand != e->episode->brand) return 0;
+  if(dae->dae_serieslink_uri) {
+    if (!e->serieslink ||
+        strcmp(dae->dae_serieslink_uri ?: "", e->serieslink->uri)) return 0;
   }
 
   if(dae->dae_btype != DVR_AUTOREC_BTYPE_ALL) {
-    if (dae->dae_btype == DVR_AUTOREC_BTYPE_NEW && e->is_repeat)
+    if (dae->dae_btype == DVR_AUTOREC_BTYPE_NEW_OR_UNKNOWN && e->is_repeat)
       return 0;
-    if (dae->dae_btype == DVR_AUTOREC_BTYPE_REPEAT && e->is_repeat == 0)
+    else if (dae->dae_btype == DVR_AUTOREC_BTYPE_NEW && !e->is_new)
+      return 0;
+    else if (dae->dae_btype == DVR_AUTOREC_BTYPE_REPEAT && e->is_repeat == 0)
       return 0;
   }
 
-  /* Do not check title if the event is from the serieslink group */
-  if(dae->dae_serieslink == NULL &&
-     dae->dae_title != NULL && dae->dae_title[0] != '\0') {
-    lang_str_ele_t *ls;
-    if (!dae->dae_fulltext) {
-      if(!e->episode->title) return 0;
-      RB_FOREACH(ls, e->episode->title, link)
-        if (!regexec(&dae->dae_title_preg, ls->str, 0, NULL, 0)) break;
-    } else {
-      ls = NULL;
-      if (e->episode->title)
-        RB_FOREACH(ls, e->episode->title, link)
-          if (!regexec(&dae->dae_title_preg, ls->str, 0, NULL, 0)) break;
-      if (!ls && e->episode->subtitle)
-        RB_FOREACH(ls, e->episode->subtitle, link)
-          if (!regexec(&dae->dae_title_preg, ls->str, 0, NULL, 0)) break;
-      if (!ls && e->summary)
-        RB_FOREACH(ls, e->summary, link)
-          if (!regexec(&dae->dae_title_preg, ls->str, 0, NULL, 0)) break;
-      if (!ls && e->description)
-        RB_FOREACH(ls, e->description, link)
-          if (!regexec(&dae->dae_title_preg, ls->str, 0, NULL, 0)) break;
-    }
-    if (!ls) return 0;
-  }
-
-  // Note: ignore channel test if we allow quality unlocking 
+  /* Note: ignore channel test if we allow quality unlocking */
   if ((cfg = dae->dae_config) == NULL)
     return 0;
   if(dae->dae_channel != NULL) {
@@ -224,8 +253,25 @@ autorec_cmp(dvr_autorec_entry_t *dae, epg_broadcast_t *e)
     epg_genre_t ct;
     memset(&ct, 0, sizeof(ct));
     ct.code = dae->dae_content_type;
-    if (!epg_genre_list_contains(&e->episode->genre, &ct, 1))
+    if (!epg_genre_list_contains(&e->genre, &ct, 1))
       return 0;
+  }
+
+  if (e->category) {
+    if (dae->dae_cat1 && *dae->dae_cat1 &&
+        !string_list_contains_string(e->category, dae->dae_cat1))
+      return 0;
+    if (dae->dae_cat2 && *dae->dae_cat2 &&
+        !string_list_contains_string(e->category, dae->dae_cat2))
+      return 0;
+    if (dae->dae_cat3 && *dae->dae_cat3 &&
+        !string_list_contains_string(e->category, dae->dae_cat3))
+      return 0;
+  } else if ((dae->dae_cat1 && *dae->dae_cat1) ||
+             (dae->dae_cat2 && *dae->dae_cat2) ||
+             (dae->dae_cat3 && *dae->dae_cat3)) {
+    /* No category in event but autorec has category, so no match. */
+    return 0;
   }
 
   if(dae->dae_start >= 0 && dae->dae_start_window >= 0 &&
@@ -263,12 +309,76 @@ autorec_cmp(dvr_autorec_entry_t *dae, epg_broadcast_t *e)
     if(duration > dae->dae_maxduration) return 0;
   }
 
+  /* Only do year/season checks when programme guide has these values available.
+   * This is because you might have "minseason=5" but Christmas specials have no
+   * no season (or season=0) and many people still want them to be picked up by
+   * default.
+   */
+  if(e->copyright_year && dae->dae_minyear > 0) {
+    if(e->copyright_year < dae->dae_minyear) return 0;
+  }
+
+  if(e->copyright_year && dae->dae_maxyear > 0) {
+    if(e->copyright_year > dae->dae_maxyear) return 0;
+  }
+
+  if(e->epnum.s_num && dae->dae_minseason > 0) {
+    if(e->epnum.s_num < dae->dae_minseason) return 0;
+  }
+
+  if(e->epnum.s_num && dae->dae_maxseason > 0) {
+    if(e->epnum.s_num > dae->dae_maxseason) return 0;
+  }
+
   if(dae->dae_weekdays != 0x7f) {
     struct tm tm;
     localtime_r(&e->start, &tm);
     if(!((1 << ((tm.tm_wday ?: 7) - 1)) & dae->dae_weekdays))
       return 0;
   }
+
+  /* If we have a dae_star_rating but the episode has no star
+   * rating (zero) then it will not be recorded.  So we do not
+   * have "&& e->episode->star_rating" here.  Conversely, if
+   * dae_star_rating is zero then that means "do not check
+   * star rating of episode".
+   */
+  if (dae->dae_star_rating)
+    if (e->star_rating < dae->dae_star_rating)
+      return 0;
+
+  /* Do not check title if the event is from the serieslink group */
+  if((dae->dae_serieslink_uri == NULL || dae->dae_serieslink_uri[0] == '\0') &&
+     dae->dae_title != NULL && dae->dae_title[0] != '\0') {
+    lang_str_ele_t *ls;
+    if (!dae->dae_fulltext) {
+      if(!e->title) return 0;
+      RB_FOREACH(ls, e->title, link)
+        if (!regex_match(&dae->dae_title_regex, ls->str)) break;
+    } else {
+      ls = NULL;
+      if (e->title)
+        RB_FOREACH(ls, e->title, link)
+          if (!regex_match(&dae->dae_title_regex, ls->str)) break;
+      if (!ls && e->subtitle)
+        RB_FOREACH(ls, e->subtitle, link)
+          if (!regex_match(&dae->dae_title_regex, ls->str)) break;
+      if (!ls && e->summary)
+        RB_FOREACH(ls, e->summary, link)
+          if (!regex_match(&dae->dae_title_regex, ls->str)) break;
+      if (!ls && e->description)
+        RB_FOREACH(ls, e->description, link)
+          if (!regex_match(&dae->dae_title_regex, ls->str)) break;
+      if (!ls && e->credits_cached)
+        RB_FOREACH(ls, e->credits_cached, link)
+          if (!regex_match(&dae->dae_title_regex, ls->str)) break;
+      if (!ls && e->keyword_cached)
+        RB_FOREACH(ls, e->keyword_cached, link)
+          if (!regex_match(&dae->dae_title_regex, ls->str)) break;
+    }
+    if (!ls) return 0;
+  }
+
   return 1;
 }
 
@@ -290,7 +400,7 @@ dvr_autorec_create(const char *uuid, htsmsg_t *conf)
   }
 
   dae->dae_weekdays = 0x7f;
-  dae->dae_pri = DVR_PRIO_NORMAL;
+  dae->dae_pri = DVR_PRIO_DEFAULT;
   dae->dae_start = -1;
   dae->dae_start_window = -1;
   dae->dae_enabled = 1;
@@ -344,16 +454,23 @@ dvr_autorec_add_series_link(const char *dvr_config_name,
 {
   dvr_autorec_entry_t *dae;
   htsmsg_t *conf;
+  const char *chname;
   char *title;
-  if (!event || !event->episode)
+  const char *name;
+  if (!event)
+    return NULL;
+  chname = channel_get_name(event->channel, NULL);
+  if (!chname)
     return NULL;
   conf = htsmsg_create_map();
   title = regexp_escape(epg_broadcast_get_title(event, NULL));
+  name = epg_broadcast_get_title(event, NULL);
   htsmsg_add_u32(conf, "enabled", 1);
   htsmsg_add_str(conf, "title", title);
+  htsmsg_add_str(conf, "name", name);
   free(title);
   htsmsg_add_str(conf, "config_name", dvr_config_name ?: "");
-  htsmsg_add_str(conf, "channel", channel_get_name(event->channel));
+  htsmsg_add_str(conf, "channel", chname);
   if (event->serieslink)
     htsmsg_add_str(conf, "serieslink", event->serieslink->uri);
   htsmsg_add_str(conf, "owner", owner ?: "");
@@ -396,24 +513,17 @@ autorec_entry_destroy(dvr_autorec_entry_t *dae, int delconf)
   free(dae->dae_owner);
   free(dae->dae_creator);
   free(dae->dae_comment);
+  free(dae->dae_cat1);
+  free(dae->dae_cat2);
+  free(dae->dae_cat3);
 
-  if(dae->dae_title != NULL) {
-    free(dae->dae_title);
-    regfree(&dae->dae_title_preg);
-  }
+  autorec_regfree(dae);
 
   if(dae->dae_channel != NULL)
     LIST_REMOVE(dae, dae_channel_link);
 
   if(dae->dae_channel_tag != NULL)
     LIST_REMOVE(dae, dae_channel_tag_link);
-
-  if(dae->dae_brand)
-    dae->dae_brand->ops->putref(dae->dae_brand);
-  if(dae->dae_season)
-    dae->dae_season->ops->putref(dae->dae_season);
-  if(dae->dae_serieslink)
-    dae->dae_serieslink->ops->putref(dae->dae_serieslink);
 
   free(dae);
 }
@@ -427,6 +537,8 @@ dvr_autorec_entry_class_changed(idnode_t *self)
 {
   dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)self;
 
+  if (dae->dae_error)
+    dae->dae_enabled = 0;
   dvr_autorec_changed(dae, 1);
   dvr_autorec_completed(dae, 0);
   htsp_autorec_entry_update(dae);
@@ -439,7 +551,8 @@ dvr_autorec_entry_class_save(idnode_t *self, char *filename, size_t fsize)
   htsmsg_t *m = htsmsg_create_map();
   char ubuf[UUID_HEX_SIZE];
   idnode_save(&dae->dae_id, m);
-  snprintf(filename, fsize, "dvr/autorec/%s", idnode_uuid_as_str(&dae->dae_id, ubuf));
+  if (filename)
+    snprintf(filename, fsize, "dvr/autorec/%s", idnode_uuid_as_str(&dae->dae_id, ubuf));
   return m;
 }
 
@@ -463,8 +576,9 @@ dvr_autorec_entry_class_perm(idnode_t *self, access_t *a, htsmsg_t *msg_to_write
   return 0;
 }
 
-static const char *
-dvr_autorec_entry_class_get_title (idnode_t *self, const char *lang)
+static void
+dvr_autorec_entry_class_get_title
+  (idnode_t *self, const char *lang, char *dst, size_t dstsize)
 {
   dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)self;
   const char *s = "";
@@ -472,7 +586,7 @@ dvr_autorec_entry_class_get_title (idnode_t *self, const char *lang)
     s = dae->dae_name;
   else if (dae->dae_comment && dae->dae_comment[0] != '\0')
     s = dae->dae_comment;
-  return s;
+  snprintf(dst, dstsize, "%s", s);
 }
 
 static int
@@ -516,7 +630,7 @@ dvr_autorec_entry_class_channel_rend(void *o, const char *lang)
 {
   dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
   if (dae->dae_channel)
-    return strdup(channel_get_name(dae->dae_channel));
+    return strdup(channel_get_name(dae->dae_channel, tvh_gettext_lang(lang, channel_blank_name)));
   return NULL;
 }
 
@@ -526,15 +640,13 @@ dvr_autorec_entry_class_title_set(void *o, const void *v)
   dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
   const char *title = v ?: "";
   if (strcmp(title, dae->dae_title ?: "")) {
-    if (dae->dae_title) {
-       regfree(&dae->dae_title_preg);
-       free(dae->dae_title);
-       dae->dae_title = NULL;
-    }
-    if (title[0] != '\0' &&
-        !regcomp(&dae->dae_title_preg, title,
-                 REG_ICASE | REG_EXTENDED | REG_NOSUB))
+    if (dae->dae_title)
+      autorec_regfree(dae);
+    dae->dae_error = 0;
+    if (!regex_compile(&dae->dae_title_regex, title, TVHREGEX_CASELESS, LS_DVR))
       dae->dae_title = strdup(title);
+    else
+      dae->dae_error = 1;
     return 1;
   }
   return 0;
@@ -620,14 +732,11 @@ dvr_autorec_entry_class_start_window_set(void *o, const void *v)
 static const void *
 dvr_autorec_entry_class_time_get(void *o, int tm)
 {
-  static const char *ret;
-  static char buf[16];
   if (tm >= 0)
-    snprintf(buf, sizeof(buf), "%02d:%02d", tm / 60, tm % 60);
+    snprintf(prop_sbuf, PROP_SBUF_LEN, "%02d:%02d", tm / 60, tm % 60);
   else
-    strncpy(buf, N_("Any"), 16);
-  ret = buf;
-  return &ret;
+    strlcpy(prop_sbuf, N_("Any"), PROP_SBUF_LEN);
+  return &prop_sbuf_ptr;
 }
 
 static const void *
@@ -791,9 +900,9 @@ dvr_autorec_entry_class_weekdays_rend(uint32_t weekdays, const char *lang)
   size_t l;
   int i;
   if (weekdays == 0x7f)
-    strcpy(buf + 1, tvh_gettext_lang(lang, N_("Every day")));
+    snprintf(buf, sizeof(buf), "%s", tvh_gettext_lang(lang, N_("Every day")));
   else if (weekdays == 0)
-    strcpy(buf + 1, tvh_gettext_lang(lang, N_("No days")));
+    snprintf(buf, sizeof(buf), "%s", tvh_gettext_lang(lang, N_("No days")));
   else {
     buf[0] = '\0';
     for (i = 0; i < 7; i++)
@@ -813,112 +922,67 @@ dvr_autorec_entry_class_weekdays_rend_(void *o, const char *lang)
   return dvr_autorec_entry_class_weekdays_rend(dae->dae_weekdays, lang);
 }
 
+/** Validate star rating is in range */
 static int
-dvr_autorec_entry_class_brand_set(void *o, const void *v)
+dvr_autorec_entry_class_star_rating_set(void *o, const void *v)
 {
   dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
-  int save;
-  epg_brand_t *brand;
+  const uint16_t *val = (uint16_t*)v;
+  if (*val > 100)
+    return 0;
+  dae->dae_star_rating = *val;
+  return 1;
+}
 
-  if (v && *(char *)v == '\0')
-    v = NULL;
-  brand = v ? epg_brand_find_by_uri(v, NULL, 1, &save, NULL) : NULL;
-  if (brand && dae->dae_brand != brand) {
-    if (dae->dae_brand)
-      dae->dae_brand->ops->putref((epg_object_t*)dae->dae_brand);
-    brand->ops->getref((epg_object_t*)brand);
-    dae->dae_brand = brand;
-    return 1;
-  } else if (brand == NULL && dae->dae_brand) {
-    dae->dae_brand->ops->putref((epg_object_t*)dae->dae_brand);
-    dae->dae_brand = NULL;
-    return 1;
+static htsmsg_t *
+dvr_autorec_entry_class_star_rating_list ( void *o, const char *lang )
+{
+  htsmsg_t *m = htsmsg_create_list();
+  htsmsg_t *e = htsmsg_create_map();
+  /* No htsmsg_add_u16 so use htsmsg_add_u32 instead */
+  htsmsg_add_u32(e, "key", 0);
+  /* Instead of "Any" we use "No rating needed" since "Any" could
+   * suggest that the programme needs a rating that could be anything,
+   * whereas many programmes have no rating at all.
+   */
+  htsmsg_add_str(e, "val", tvh_gettext_lang(lang, N_("No rating needed")));
+  htsmsg_add_msg(m, NULL, e);
+
+  uint32_t i;
+  /* We create the list from highest to lowest since you're more
+   * likely to want to record something with a high rating than scroll
+   * through the list to find programmes with a poor rating.
+   */
+  for (i = 100; i > 0 ; i-=5) {
+    e = htsmsg_create_map();
+    htsmsg_add_u32(e, "key", i);
+    htsmsg_add_u32(e, "val", i);
+    htsmsg_add_msg(m, NULL, e);
   }
-  return 0;
+  return m;
 }
 
-static const void *
-dvr_autorec_entry_class_brand_get(void *o)
+/** Generate a year list to make it easier to select min/max year */
+static htsmsg_t *
+dvr_autorec_entry_class_year_list ( void *o, const char *lang )
 {
-  static const char *ret;
-  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
-  if (dae->dae_brand)
-    ret = dae->dae_brand->uri;
-  else
-    ret = "";
-  return &ret;
-}
+  htsmsg_t *m = htsmsg_create_list();
+  htsmsg_t *e = htsmsg_create_map();
+  htsmsg_add_u32(e, "key", 0);
+  htsmsg_add_str(e, "val", tvh_gettext_lang(lang, N_("Any")));
+  htsmsg_add_msg(m, NULL, e);
 
-static int
-dvr_autorec_entry_class_season_set(void *o, const void *v)
-{
-  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
-  int save;
-  epg_season_t *season;
-
-  if (v && *(char *)v == '\0')
-    v = NULL;
-  season = v ? epg_season_find_by_uri(v, NULL, 1, &save, NULL) : NULL;
-  if (season && dae->dae_season != season) {
-    if (dae->dae_season)
-      dae->dae_season->ops->putref((epg_object_t*)dae->dae_season);
-    season->ops->getref((epg_object_t*)season);
-    dae->dae_season = season;
-    return 1;
-  } else if (season == NULL && dae->dae_season) {
-    dae->dae_season->ops->putref((epg_object_t*)dae->dae_season);
-    dae->dae_season = NULL;
-    return 1;
+  uint32_t i;
+  /* We create the list from highest to lowest since you're more
+   * likely to want to record something recent.
+   */
+  for (i = 2020; i > 1900 ; i-=5) {
+    e = htsmsg_create_map();
+    htsmsg_add_u32(e, "key", i);
+    htsmsg_add_u32(e, "val", i);
+    htsmsg_add_msg(m, NULL, e);
   }
-  return 0;
-}
-
-static const void *
-dvr_autorec_entry_class_season_get(void *o)
-{
-  static const char *ret;
-  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
-  if (dae->dae_season)
-    ret = dae->dae_season->uri;
-  else
-    ret = "";
-  return &ret;
-}
-
-static int
-dvr_autorec_entry_class_series_link_set(void *o, const void *v)
-{
-  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
-  int save;
-  epg_serieslink_t *sl;
-
-  if (v && *(char *)v == '\0')
-    v = NULL;
-  sl = v ? epg_serieslink_find_by_uri(v, NULL, 1, &save, NULL) : NULL;
-  if (sl && dae->dae_serieslink != sl) {
-    if (dae->dae_serieslink)
-      dae->dae_serieslink->ops->putref((epg_object_t*)dae->dae_season);
-    sl->ops->getref((epg_object_t*)sl);
-    dae->dae_serieslink = sl;
-    return 1;
-  } else if (sl == NULL && dae->dae_serieslink) {
-    dae->dae_season->ops->putref((epg_object_t*)dae->dae_season);
-    dae->dae_season = NULL;
-    return 1;
-  }
-  return 0;
-}
-
-static const void *
-dvr_autorec_entry_class_series_link_get(void *o)
-{
-  static const char *ret;
-  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
-  if (dae->dae_serieslink)
-    ret = dae->dae_serieslink->uri;
-  else
-    ret = "";
-  return &ret;
+  return m;
 }
 
 static htsmsg_t *
@@ -936,6 +1000,8 @@ dvr_autorec_entry_class_dedup_list ( void *o, const char *lang )
   static const struct strtab tab[] = {
     { N_("Record all"),
         DVR_AUTOREC_RECORD_ALL },
+    { N_("All: Record if EPG/XMLTV indicates it is a unique programme"),
+        DVR_AUTOREC_RECORD_UNIQUE },
     { N_("All: Record if different episode number"),
         DVR_AUTOREC_RECORD_DIFFERENT_EPISODE_NUMBER },
     { N_("All: Record if different subtitle"),
@@ -973,6 +1039,8 @@ dvr_autorec_entry_class_btype_list ( void *o, const char *lang )
     { N_("Any"),
         DVR_AUTOREC_BTYPE_ALL },
     { N_("New / premiere / unknown"),
+        DVR_AUTOREC_BTYPE_NEW_OR_UNKNOWN },
+    { N_("New / premiere"),
         DVR_AUTOREC_BTYPE_NEW },
     { N_("Repeated"),
         DVR_AUTOREC_BTYPE_REPEAT },
@@ -980,8 +1048,18 @@ dvr_autorec_entry_class_btype_list ( void *o, const char *lang )
   return strtab2htsmsg(tab, 1, lang);
 }
 
+static htsmsg_t *
+dvr_autorec_entry_category_list ( void *o, const char *lang )
+{
+  htsmsg_t *m = htsmsg_create_map();
+  htsmsg_add_str(m, "type",  "api");
+  htsmsg_add_str(m, "uri",   "channelcategory/list");
+  return m;
+}
+
+
 static uint32_t
-dvr_autorec_entry_class_owner_opts(void *o)
+dvr_autorec_entry_class_owner_opts(void *o, uint32_t opts)
 {
   dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)o;
   if (dae && dae->dae_id.in_access &&
@@ -992,6 +1070,28 @@ dvr_autorec_entry_class_owner_opts(void *o)
 
 CLASS_DOC(dvrautorec)
 PROP_DOC(duplicate_handling)
+
+/* We provide several category drop-downs to make it easy for user
+ * to select several. So abstract the properties away since they
+ * are nearly identical for each entry.
+ */
+#define CATEGORY_SELECTION_PROP(NUM)                                  \
+  .type     = PT_STR,                                                 \
+  .id       = "cat" #NUM,                                             \
+  .name     = N_("Category " #NUM  " (selection)"),                   \
+  .desc     = N_("The category of the program to look for. The xmltv "\
+                 "providers often supply detailed categories such as "\
+                 "Sitcom, Movie, Track/field, etc. "                  \
+                 "This let you select from categories for current programmes. " \
+                 "It is then combined (AND) with other fields to limit to " \
+                 "programmes that match all categories. "             \
+                 "If this selection list is empty then it means your provider does not " \
+                 "supply programme categories."                       \
+                 ),                                                   \
+  .off      = offsetof(dvr_autorec_entry_t, dae_cat ## NUM),          \
+  .opts     = PO_EXPERT,                                              \
+  .list     = dvr_autorec_entry_category_list
+
 
 const idclass_t dvr_autorec_entry_class = {
   .ic_class      = "dvrautorec",
@@ -1039,6 +1139,21 @@ const idclass_t dvr_autorec_entry_class = {
                      "this accepts case-insensitive regular expressions."),
       .set      = dvr_autorec_entry_class_title_set,
       .off      = offsetof(dvr_autorec_entry_t, dae_title),
+    },
+    /* We provide a small number of selection drop-downs. This is to
+     * make it easier for users to see what categories are available and
+     * make it easy to record for example '"Movie" "Martial arts" "Western"'
+     * without user needing a regex, and allowing them to easily see what
+     * categories they have available.
+     */
+    {
+      CATEGORY_SELECTION_PROP(1)
+    },
+    {
+      CATEGORY_SELECTION_PROP(2)
+    },
+    {
+      CATEGORY_SELECTION_PROP(3)
     },
     {
       .type     = PT_BOOL,
@@ -1092,6 +1207,18 @@ const idclass_t dvr_autorec_entry_class = {
       .list     = dvr_autorec_entry_class_content_type_list,
       .off      = offsetof(dvr_autorec_entry_t, dae_content_type),
       .opts     = PO_ADVANCED,
+    },
+    {
+      .type     = PT_U16,
+      .id       = "star_rating",
+      .name     = N_("Star rating"),
+      .desc     = N_("The minimum number of stars the broadcast should have - in "
+                     "other words, only match programs that have at "
+                     "least this rating."),
+      .set      = dvr_autorec_entry_class_star_rating_set,
+      .list     = dvr_autorec_entry_class_star_rating_list,
+      .off      = offsetof(dvr_autorec_entry_t, dae_star_rating),
+      .opts     = PO_EXPERT | PO_DOC_NLIST,
     },
     {
       .type     = PT_STR,
@@ -1176,13 +1303,48 @@ const idclass_t dvr_autorec_entry_class = {
     },
     {
       .type     = PT_U32,
+      .id       = "minyear",
+      .name     = N_("Minimum year"),
+      .desc     = N_("The earliest year for the programme. Programmes must be equal to or later than this year."),
+      .list     = dvr_autorec_entry_class_year_list,
+      .off      = offsetof(dvr_autorec_entry_t, dae_minyear),
+      .opts     = PO_EXPERT | PO_DOC_NLIST,
+    },
+    {
+      .type     = PT_U32,
+      .id       = "maxyear",
+      .name     = N_("Maximum year"),
+      .desc     = N_("The latest year for the programme. Programmes must be equal to or earlier than this year."),
+      .list     = dvr_autorec_entry_class_year_list,
+      .off      = offsetof(dvr_autorec_entry_t, dae_maxyear),
+      .opts     = PO_EXPERT | PO_DOC_NLIST,
+    },
+    {
+      .type     = PT_U16,
+      .id       = "minseason",
+      .name     = N_("Minimum season"),
+      .desc     = N_("The earliest season for the programme. Programmes must be equal to or later than this season."),
+      .off      = offsetof(dvr_autorec_entry_t, dae_minseason),
+      .opts     = PO_EXPERT | PO_DOC_NLIST,
+    },
+    {
+      .type     = PT_U16,
+      .id       = "maxseason",
+      .name     = N_("Maximum season"),
+      .desc     = N_("The latest season for the programme. Programmes must be equal to or earlier than this season."),
+      .off      = offsetof(dvr_autorec_entry_t, dae_maxseason),
+      .opts     = PO_EXPERT | PO_DOC_NLIST,
+    },
+    {
+      .type     = PT_U32,
       .id       = "pri",
       .name     = N_("Priority"),
-      .desc     = N_("The priority of any recordings set because of this "
-                     "rule will take precedence and "
-                     "cancel lower-priority events."),
+      .desc     = N_("Priority of the recording. Higher priority entries "
+                     "will take precedence and cancel lower-priority events. "
+                     "The 'Not Set' value inherits the settings from "
+                     "the assigned DVR configuration."),
       .list     = dvr_entry_class_pri_list,
-      .def.i    = DVR_PRIO_NORMAL,
+      .def.i    = DVR_PRIO_DEFAULT,
       .off      = offsetof(dvr_autorec_entry_t, dae_pri),
       .opts     = PO_ADVANCED | PO_DOC_NLIST,
     },
@@ -1195,7 +1357,7 @@ const idclass_t dvr_autorec_entry_class = {
       .doc      = prop_doc_duplicate_handling,
       .off      = offsetof(dvr_autorec_entry_t, dae_record),
       .list     = dvr_autorec_entry_class_dedup_list,
-      .opts     = PO_ADVANCED | PO_DOC_NLIST,
+      .opts     = PO_HIDDEN | PO_ADVANCED | PO_DOC_NLIST,
     },
     {
       .type     = PT_U32,
@@ -1248,29 +1410,10 @@ const idclass_t dvr_autorec_entry_class = {
     },
     {
       .type     = PT_STR,
-      .id       = "brand",
-      .name     = N_("Brand"),
-      .desc     = N_("Branding information (if available)."),
-      .set      = dvr_autorec_entry_class_brand_set,
-      .get      = dvr_autorec_entry_class_brand_get,
-      .opts     = PO_RDONLY | PO_ADVANCED,
-    },
-    {
-      .type     = PT_STR,
-      .id       = "season",
-      .name     = N_("Season"),
-      .desc     = N_("Season information (if available)."),
-      .set      = dvr_autorec_entry_class_season_set,
-      .get      = dvr_autorec_entry_class_season_get,
-      .opts     = PO_RDONLY | PO_ADVANCED,
-    },
-    {
-      .type     = PT_STR,
       .id       = "serieslink",
       .name     = N_("Series link"),
       .desc     = N_("Series link ID."),
-      .set      = dvr_autorec_entry_class_series_link_set,
-      .get      = dvr_autorec_entry_class_series_link_get,
+      .off      = offsetof(dvr_autorec_entry_t, dae_serieslink_uri),
       .opts     = PO_RDONLY | PO_ADVANCED,
     },
     {
@@ -1317,7 +1460,7 @@ dvr_autorec_init(void)
     HTSMSG_FOREACH(f, l) {
       if((c = htsmsg_get_map_by_field(f)) == NULL)
         continue;
-      (void)dvr_autorec_create(f->hmf_name, c);
+      (void)dvr_autorec_create(htsmsg_field_name(f), c);
     }
     htsmsg_destroy(l);
   }
@@ -1328,10 +1471,10 @@ dvr_autorec_done(void)
 {
   dvr_autorec_entry_t *dae;
 
-  pthread_mutex_lock(&global_lock);
+  tvh_mutex_lock(&global_lock);
   while ((dae = TAILQ_FIRST(&autorec_entries)) != NULL)
     autorec_entry_destroy(dae, 0);
-  pthread_mutex_unlock(&global_lock);
+  tvh_mutex_unlock(&global_lock);
 }
 
 void
@@ -1342,6 +1485,29 @@ dvr_autorec_update(void)
     dvr_autorec_changed(dae, 0);
     dvr_autorec_completed(dae, 0);
   }
+}
+
+static void
+dvr_autorec_async_reschedule_cb(void *ignored)
+{
+  tvhdebug(LS_DVR, "dvr_autorec_async_reschedule_cb - begin");
+  dvr_autorec_update();
+  tvhdebug(LS_DVR, "dvr_autorec_async_reschedule_cb - end");
+}
+
+void
+dvr_autorec_async_reschedule(void)
+{
+  tvhtrace(LS_DVR, "dvr_autorec_async_reschedule");
+  static mtimer_t reschedule_timer;
+  mtimer_disarm(&reschedule_timer);
+  /* We schedule the update after a brief period. This allows the
+   * system to quiesce in case the user is doing a large operation
+   * such as deleting numerous records due to disabling an autorec
+   * rule.
+   */
+  mtimer_arm_rel(&reschedule_timer, dvr_autorec_async_reschedule_cb, NULL,
+                 sec2mono(60));
 }
 
 /**
@@ -1355,28 +1521,10 @@ dvr_autorec_check_event(epg_broadcast_t *e)
   if (e->channel && !e->channel->ch_enabled)
     return;
   TAILQ_FOREACH(dae, &autorec_entries, dae_link)
-    if(autorec_cmp(dae, e))
+    if(dvr_autorec_cmp(dae, e))
       dvr_entry_create_by_autorec(1, e, dae);
   // Note: no longer updating event here as it will be done from EPG
   //       anyway
-}
-
-void dvr_autorec_check_brand(epg_brand_t *b)
-{
-// Note: for the most part this will only be relevant should an episode
-//       to which a broadcast is linked suddenly get added to a new brand
-//       this is pretty damn unlikely!
-}
-
-void dvr_autorec_check_season(epg_season_t *s)
-{
-// Note: I guess new episodes might have been added, but again its likely
-//       this will already have been picked up by the check_event call
-}
-
-void dvr_autorec_check_serieslink(epg_serieslink_t *s)
-{
-// TODO: need to implement this
 }
 
 /**
@@ -1395,7 +1543,7 @@ dvr_autorec_changed(dvr_autorec_entry_t *dae, int purge)
   CHANNEL_FOREACH(ch) {
     if (!ch->ch_enabled) continue;
     RB_FOREACH(e, &ch->ch_epg_schedule, sched_link) {
-      if(autorec_cmp(dae, e)) {
+      if(dvr_autorec_cmp(dae, e)) {
         enabled = 1;
         if (disabled) {
           for (p = disabled; *p && *p != e; p++);

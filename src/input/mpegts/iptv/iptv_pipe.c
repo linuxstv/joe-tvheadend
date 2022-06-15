@@ -20,19 +20,20 @@
 #include "tvheadend.h"
 #include "iptv_private.h"
 #include "spawn.h"
+#include "tvhpoll.h"
 
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <fcntl.h>
-#include <signal.h>
 #include <assert.h>
 
 /*
- * Connect UDP/RTP
+ * Spawn task and create pipes
  */
 static int
-iptv_pipe_start ( iptv_mux_t *im, const char *raw, const url_t *url )
+iptv_pipe_start
+  ( iptv_input_t *mi, iptv_mux_t *im, const char *raw, const url_t *url )
 {
   char **argv = NULL, **envp = NULL;
   const char *replace[] = { "${service_name}", im->mm_iptv_svcname ?: "", NULL };
@@ -53,6 +54,8 @@ iptv_pipe_start ( iptv_mux_t *im, const char *raw, const url_t *url )
     goto err;
   }
 
+  tvhtrace(LS_IPTV, "iptv pipe: spawned \"%s\" rd %d pid %d", argv[0], rd, pid);
+
   spawn_free_args(argv);
   spawn_free_args(envp);
 
@@ -65,7 +68,7 @@ iptv_pipe_start ( iptv_mux_t *im, const char *raw, const url_t *url )
   im->mm_iptv_respawn_last = mclk();
 
   if (url)
-    iptv_input_mux_started(im);
+    iptv_input_mux_started(mi, im, 1);
   return 0;
 
 err:
@@ -76,33 +79,17 @@ err:
   return -1;
 }
 
-static int
-iptv_pipe_kill_sig(iptv_mux_t *im)
-{
-  switch (im->mm_iptv_kill) {
-  case IPTV_KILL_TERM: return SIGTERM;
-  case IPTV_KILL_INT:  return SIGINT;
-  case IPTV_KILL_HUP:  return SIGHUP;
-  case IPTV_KILL_USR1: return SIGUSR1;
-  case IPTV_KILL_USR2: return SIGUSR2;
-  }
-  return SIGKILL;
-}
-
 static void
 iptv_pipe_stop
-  ( iptv_mux_t *im )
+  ( iptv_input_t *mi, iptv_mux_t *im )
 {
-  int rd = im->mm_iptv_fd;
   pid_t pid = (intptr_t)im->im_data;
-  spawn_kill(pid, iptv_pipe_kill_sig(im), im->mm_iptv_kill_timeout);
-  if (rd > 0)
-    close(rd);
-  im->mm_iptv_fd = -1;
+  spawn_kill(pid, tvh_kill_to_sig(im->mm_iptv_kill), im->mm_iptv_kill_timeout);
+  iptv_input_close_fds(mi, im);
 }
 
 static ssize_t
-iptv_pipe_read ( iptv_mux_t *im )
+iptv_pipe_read ( iptv_input_t *mi, iptv_mux_t *im )
 {
   int r, rd = im->mm_iptv_fd;
   ssize_t res = 0;
@@ -118,30 +105,29 @@ iptv_pipe_read ( iptv_mux_t *im )
         continue;
     }
     if (r <= 0) {
-      close(rd);
+      iptv_input_close_fds(mi, im);
       pid = (intptr_t)im->im_data;
-      spawn_kill(pid, iptv_pipe_kill_sig(im), im->mm_iptv_kill_timeout);
-      im->mm_iptv_fd = -1;
       im->im_data = NULL;
+      spawn_kill(pid, tvh_kill_to_sig(im->mm_iptv_kill), im->mm_iptv_kill_timeout);
       if (mclk() < im->mm_iptv_respawn_last + sec2mono(2)) {
-        tvherror(LS_IPTV, "stdin pipe unexpectedly closed: %s",
-                 r < 0 ? strerror(errno) : "No data");
+        tvherror(LS_IPTV, "stdin pipe %d unexpectedly closed: %s",
+                 rd, r < 0 ? strerror(errno) : "No data");
       } else {
         /* avoid deadlock here */
-        pthread_mutex_unlock(&iptv_lock);
-        pthread_mutex_lock(&global_lock);
-        pthread_mutex_lock(&iptv_lock);
+        tvh_mutex_unlock(&iptv_lock);
+        tvh_mutex_lock(&global_lock);
+        tvh_mutex_lock(&iptv_lock);
         if (im->mm_active) {
-          if (iptv_pipe_start(im, im->mm_iptv_url_raw, NULL)) {
+          if (iptv_pipe_start(mi, im, im->mm_iptv_url_raw, NULL)) {
             tvherror(LS_IPTV, "unable to respawn %s", im->mm_iptv_url_raw);
           } else {
-            iptv_input_fd_started(im);
+            iptv_input_fd_started(mi, im);
             im->mm_iptv_respawn_last = mclk();
           }
         }
-        pthread_mutex_unlock(&iptv_lock);
-        pthread_mutex_unlock(&global_lock);
-        pthread_mutex_lock(&iptv_lock);
+        tvh_mutex_unlock(&iptv_lock);
+        tvh_mutex_unlock(&global_lock);
+        tvh_mutex_lock(&iptv_lock);
       }
       break;
     }

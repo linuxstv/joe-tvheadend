@@ -20,18 +20,21 @@
 #include <limits.h>
 #include <string.h>
 #include <assert.h>
-#include <openssl/md5.h>
+#include <openssl/evp.h>
+#include <openssl/opensslv.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <dirent.h>
 #include <unistd.h>
 #include <ctype.h>
+#include <signal.h>
 #include <net/if.h>
 
 #include <openssl/sha.h>
 
 #include "tvheadend.h"
 #include "tvh_endian.h"
+#include "sbuf.h"
 
 /**
  * CRC32 
@@ -182,23 +185,24 @@ static const uint8_t map2[] =
 int 
 base64_decode(uint8_t *out, const char *in, int out_size)
 {
-    int i, v;
-    uint8_t *dst = out;
+  int i, v;
+  unsigned int index;
+  uint8_t *dst = out;
 
-    v = 0;
-    for (i = 0; in[i] && in[i] != '='; i++) {
-        unsigned int index= in[i]-43;
-        if (index >= sizeof(map2) || map2[index] == 0xff)
-            return -1;
-        v = (v << 6) + map2[index];
-        if (i & 3) {
-            if (dst - out < out_size) {
-                *dst++ = v >> (6 - 2 * (i & 3));
-            }
-        }
+  v = 0;
+  for (i = 0; *in && *in != '='; i++, in++) {
+    index = *in - 43;
+    if (index >= sizeof(map2) || map2[index] == 0xff)
+      return -1;
+    v = (v << 6) + map2[index];
+    if (i & 3) {
+      if (dst - out < out_size) {
+        *dst++ = v >> (6 - 2 * (i & 3));
+      }
     }
+  }
 
-    return dst - out;
+  return dst - out;
 }
 
 /*
@@ -206,35 +210,33 @@ base64_decode(uint8_t *out, const char *in, int out_size)
  * Simplified by Michael.
  * Fixed edge cases and made it work from data (vs. strings) by Ryan.
  */
-
 char *base64_encode(char *out, int out_size, const uint8_t *in, int in_size)
 {
-    static const char b64[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    char *ret, *dst;
-    unsigned i_bits = 0;
-    int i_shift = 0;
-    int bytes_remaining = in_size;
+  static const char b64[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  char *dst;
+  unsigned i_bits = 0;
+  int i_shift = 0;
+  int bytes_remaining = in_size;
 
-    if (in_size >= UINT_MAX / 4 ||
-        out_size < BASE64_SIZE(in_size))
-        return NULL;
-    ret = dst = out;
-    while (bytes_remaining) {
-        i_bits = (i_bits << 8) + *in++;
-        bytes_remaining--;
-        i_shift += 8;
+  if (in_size >= UINT_MAX / 4 ||
+      out_size < BASE64_SIZE(in_size))
+      return NULL;
+  dst = out;
+  while (bytes_remaining) {
+    i_bits = (i_bits << 8) + *in++;
+    bytes_remaining--;
+    i_shift += 8;
+    do {
+      *dst++ = b64[(i_bits << 6 >> i_shift) & 0x3f];
+      i_shift -= 6;
+    } while (i_shift > 6 || (bytes_remaining == 0 && i_shift > 0));
+  }
+  while ((dst - out) & 3)
+    *dst++ = '=';
+  *dst = '\0';
 
-        do {
-            *dst++ = b64[(i_bits << 6 >> i_shift) & 0x3f];
-            i_shift -= 6;
-        } while (i_shift > 6 || (bytes_remaining == 0 && i_shift > 0));
-    }
-    while ((dst - ret) & 3)
-        *dst++ = '=';
-    *dst = '\0';
-
-    return ret;
+  return out;
 }
 
 /**
@@ -290,10 +292,76 @@ put_utf8(char *out, int c)
   return 6;
 }
 
-static void
-sbuf_alloc_fail(int len)
+char *utf8_lowercase_inplace(char *s)
 {
-  fprintf(stderr, "Unable to allocate %d bytes\n", len);
+  char *r = s;
+  uint8_t c;
+
+  for ( ; *s; s++) {
+    /* FIXME: this is really wrong version of lowercase for utf-8 */
+    /* but it's a deep issue with the different locale handling */
+    c = (uint8_t)*s;
+    if (c & 0x80) {
+      if ((c & 0xe0) == 0xc0) {
+        s++;
+        continue;
+      } else if ((c & 0xf0) == 0xe0) {
+        s++;
+        if (*s) s++;
+      } else if ((c & 0xf8) == 0xf0) {
+        s++;
+        if (*s) s++;
+        if (*s) s++;
+      }
+    }
+    if (c >= 'A' && c <= 'Z')
+      *(char *)s = c - 'A' + 'a';
+  }
+  return r;
+}
+
+static int utf8_len(char first)
+{
+  if ((first & 0xe0) == 0xc0) return 2;
+  if ((first & 0xf0) == 0xe0) return 3;
+  if ((first & 0xf8) == 0xf0) return 4;
+  if ((first & 0xfc) == 0xf8) return 5;
+  if ((first & 0xfe) == 0xfc) return 6;
+  assert(0);
+  return 1;
+}
+
+/*
+ * Remove the partial utf8 character at the end of the string
+ */
+char *utf8_validate_inplace(char *s)
+{
+  if (s == NULL) return NULL;
+  size_t i, l = strlen(s);
+  if (l < 1) return s;
+  for (i = l; i > 0; i--) {
+    char c = s[i-1];
+    if ((c & 0x80) == 0) {
+      if (l != i) s[i] = '\0';
+      break;
+    }
+    if ((c & 0xc0) == 0xc0) {
+      if (1 + l - i != utf8_len(c))
+        s[i-1] = '\0';
+      break;
+    }
+  }
+  return s;
+}
+
+/**
+ *
+ */
+
+static void
+sbuf_alloc_fail(size_t len)
+{
+  fprintf(stderr, "Unable to allocate %zd bytes\n", len);
   abort();
 }
 
@@ -377,11 +445,34 @@ sbuf_realloc(sbuf_t *sb, int len)
 }
 
 void
+sbuf_replace(sbuf_t *sb, sbuf_t *src)
+{
+  sbuf_free(sb);
+  *sb = *src;
+  sbuf_init(src);
+}
+
+void
 sbuf_append(sbuf_t *sb, const void *data, int len)
 {
   sbuf_alloc(sb, len);
   memcpy(sb->sb_data + sb->sb_ptr, data, len);
   sb->sb_ptr += len;
+}
+
+void
+sbuf_append_from_sbuf(sbuf_t *sb, sbuf_t *src)
+{
+  if (sb->sb_ptr == 0) {
+    sbuf_free(sb);
+    sb->sb_data = src->sb_data;
+    sb->sb_ptr = src->sb_ptr;
+    sb->sb_size = src->sb_size;
+    sbuf_steal_data(src);
+  } else {
+    sbuf_append(sb, src->sb_data, src->sb_ptr);
+    src->sb_ptr = 0;
+  }
 }
 
 void
@@ -467,18 +558,81 @@ sbuf_read(sbuf_t *sb, int fd)
   return n;
 }
 
+/**
+ *
+ */
+
+static uint8_t *
+openssl_hash ( uint8_t *hash, const uint8_t *msg, size_t msglen, const EVP_MD *md )
+{
+  EVP_MD_CTX *mdctx;
+
+  if ((mdctx = EVP_MD_CTX_create()) == NULL)
+    return NULL;
+  if (EVP_DigestInit_ex(mdctx, md, NULL) != 1)
+    goto __error;
+  if (EVP_DigestUpdate(mdctx, msg, msglen) != 1)
+    goto __error;
+  if (EVP_DigestFinal_ex(mdctx, hash, NULL) != 1)
+    goto __error;
+  EVP_MD_CTX_destroy(mdctx);
+  return hash;
+__error:
+  EVP_MD_CTX_destroy(mdctx);
+  return NULL;
+}
+
+static char *
+openssl_hash_hexstr ( const char *str, int lowercase, const EVP_MD *md, int len )
+{
+  int i;
+  uint8_t hash[len];
+  char *ret = malloc((len * 2) + 1);
+  const char *fmt = lowercase ? "%02x" : "%02X";
+  if (ret == NULL) return NULL;
+  if (openssl_hash(hash, (const uint8_t *)str, strlen(str), md) == NULL) {
+    free(ret);
+    return NULL;
+  }
+  for (i = 0; i < len; i++)
+    sprintf(ret + i*2, fmt, hash[i]);
+  ret[len*2] = '\0';
+  return ret;
+}
+
 char *
 md5sum ( const char *str, int lowercase )
 {
-  uint8_t md5[MD5_DIGEST_LENGTH];
-  char *ret = malloc((MD5_DIGEST_LENGTH * 2) + 1);
-  int i;
+  return openssl_hash_hexstr(str, lowercase, EVP_md5(), 16);
+}
 
-  MD5((const unsigned char*)str, strlen(str), md5);
-  for (i = 0; i < MD5_DIGEST_LENGTH; i++)
-    sprintf(&ret[i*2], lowercase ? "%02x" : "%02X", md5[i]);
-  ret[MD5_DIGEST_LENGTH*2] = '\0';
-  return ret;
+char *
+sha256sum ( const char *str, int lowercase )
+{
+  return openssl_hash_hexstr(str, lowercase, EVP_sha256(), 32);
+}
+
+char *
+sha512sum256 ( const char *str, int lowercase )
+{
+#if OPENSSL_VERSION_NUMBER >= 0x1010101fL
+  return openssl_hash_hexstr(str, lowercase, EVP_sha512_256(), 32);
+#else
+  return NULL;
+#endif
+}
+
+char *
+sha256sum_base64 ( const char *str )
+{
+  uint8_t hash[32];
+  char *out = malloc(64);
+  if (out == NULL) return NULL;
+  if (openssl_hash(hash, (const uint8_t *)str, strlen(str), EVP_sha256()) == NULL) {
+    free(out);
+    return NULL;
+  }
+  return base64_encode(out, 64, hash, 32);
 }
 
 #define FILE_MODE_BITS(x) (x&(S_IRWXU|S_IRWXG|S_IRWXO))
@@ -622,6 +776,59 @@ char *url_encode(const char *str)
   return buf;
 }
 
+/**
+ * De-escape HTTP URL
+ */
+void
+http_deescape(char *s)
+{
+  char v, *d = s;
+
+  while(*s) {
+    if(*s == '+') {
+      *d++ = ' ';
+      s++;
+    } else if(*s == '%') {
+      s++;
+      switch(*s) {
+      case '0' ... '9':
+	v = (*s - '0') << 4;
+	break;
+      case 'a' ... 'f':
+	v = (*s - 'a' + 10) << 4;
+	break;
+      case 'A' ... 'F':
+	v = (*s - 'A' + 10) << 4;
+	break;
+      default:
+	*d = 0;
+	return;
+      }
+      s++;
+      switch(*s) {
+      case '0' ... '9':
+	v |= (*s - '0');
+	break;
+      case 'a' ... 'f':
+	v |= (*s - 'a' + 10);
+	break;
+      case 'A' ... 'F':
+	v |= (*s - 'A' + 10);
+	break;
+      default:
+	*d = 0;
+	return;
+      }
+      s++;
+
+      *d++ = v;
+    } else {
+      *d++ = *s++;
+    }
+  }
+  *d = 0;
+}
+
 /*
  *
  */
@@ -739,8 +946,10 @@ deferred_unlink(const char *filename, const char *rootdir)
     free(s);
     return r;
   }
-  if (rootdir == NULL)
+  if (rootdir == NULL){
+    dvr_cutpoint_delete_files (filename);
     tasklet_arm_alloc(deferred_unlink_cb, s);
+  }
   else {
     du = calloc(1, sizeof(*du));
     if (du == NULL) {
@@ -749,6 +958,7 @@ deferred_unlink(const char *filename, const char *rootdir)
     }
     du->filename = s;
     du->rootdir = strdup(rootdir);
+    dvr_cutpoint_delete_files (filename);
     tasklet_arm_alloc(deferred_unlink_dir_cb, du);
   }
   return 0;
@@ -814,4 +1024,17 @@ gmtime2local(time_t gmt, char *buf, size_t buflen)
   localtime_r(&gmt, &tm);
   strftime(buf, buflen, "%F;%T(%z)", &tm);
   return buf;
+}
+
+int
+tvh_kill_to_sig(int tvh_kill)
+{
+  switch (tvh_kill) {
+  case TVH_KILL_TERM: return SIGTERM;
+  case TVH_KILL_INT:  return SIGINT;
+  case TVH_KILL_HUP:  return SIGHUP;
+  case TVH_KILL_USR1: return SIGUSR1;
+  case TVH_KILL_USR2: return SIGUSR2;
+  }
+  return SIGKILL;
 }

@@ -17,7 +17,6 @@
  *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <pthread.h>
 #include <signal.h>
 #include "tvheadend.h"
 #include "htsbuf.h"
@@ -38,7 +37,7 @@ rtsp_send_ext( http_client_t *hc, http_cmd_t cmd,
                 (hc->hc_port != 554 ? 7 : 0) +
                 (path ? strlen(path) : 1) + 1;
   char *buf = alloca(blen);
-  char buf2[7];
+  char buf2[11];
   char buf_body[size + 3];
 
   if (hc->hc_rtsp_session) {
@@ -54,8 +53,8 @@ rtsp_send_ext( http_client_t *hc, http_cmd_t cmd,
       hdr = &h;
       http_arg_init(&h);
     }
-    strncpy(buf_body, body, sizeof(buf_body));
-    strncat(buf_body, "\r\n", 2);
+    strlcpy(buf_body, body, sizeof(buf_body));
+    strlcat(buf_body, "\r\n", 2);
     snprintf(buf2, sizeof(buf2), "%"PRIu64, (uint64_t)(size + 2));
     http_arg_set(hdr, "Content-Length", buf2);
   }

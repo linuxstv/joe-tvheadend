@@ -18,6 +18,7 @@
 
 
 #include "tvheadend.h"
+#include "streaming.h"
 #include "packet.h"
 #include "string.h"
 #include "atomic.h"
@@ -52,21 +53,32 @@ pkt_destroy(th_pkt_t *pkt)
  * suppoed to take care of)
  */
 th_pkt_t *
-pkt_alloc(streaming_component_type_t type, const void *data, size_t datalen,
+pkt_alloc(streaming_component_type_t type, const uint8_t *data, size_t datalen,
           int64_t pts, int64_t dts, int64_t pcr)
 {
   th_pkt_t *pkt;
+  pktbuf_t *payload;
+
+  if (datalen > 0) {
+    payload = pktbuf_alloc(data, datalen);
+    if (payload == NULL)
+      return NULL;
+  } else {
+    payload = NULL;
+  }
 
   pkt = calloc(1, sizeof(th_pkt_t));
   if (pkt) {
     pkt->pkt_type = type;
-    if(datalen)
-      pkt->pkt_payload = pktbuf_alloc(data, datalen);
+    pkt->pkt_payload = payload;
     pkt->pkt_dts = dts;
     pkt->pkt_pts = pts;
     pkt->pkt_pcr = pcr;
     pkt->pkt_refcount = 1;
     memoryinfo_alloc(&pkt_memoryinfo, sizeof(*pkt));
+  } else {
+    if (payload)
+      pktbuf_ref_dec(payload);
   }
   return pkt;
 }
@@ -81,7 +93,7 @@ pkt_copy_shallow(th_pkt_t *pkt)
   th_pkt_t *n = malloc(sizeof(th_pkt_t));
 
   if (n) {
-    *n = *pkt;
+    blacklisted_memcpy(n, pkt, sizeof(*pkt));
 
     n->pkt_refcount = 1;
 
@@ -104,7 +116,7 @@ pkt_copy_nodata(th_pkt_t *pkt)
   th_pkt_t *n = malloc(sizeof(th_pkt_t));
 
   if (n) {
-    *n = *pkt;
+    blacklisted_memcpy(n, pkt, sizeof(*pkt));
 
     n->pkt_refcount = 1;
 
@@ -153,7 +165,7 @@ void
 pkt_trace_(const char *file, int line, int subsys, th_pkt_t *pkt,
            const char *fmt, ...)
 {
-  char buf[512], _dts[22], _pts[22], _type[2];
+  char buf[512], _pcr[22], _dts[22], _pts[22], _type[2], _meta[20];
   va_list args;
 
   va_start(args, fmt);
@@ -163,20 +175,26 @@ pkt_trace_(const char *file, int line, int subsys, th_pkt_t *pkt,
   } else {
     _type[0] = '\0';
   }
+  if (pkt->pkt_meta)
+    snprintf(_meta, sizeof(_meta), " meta %zu", pktbuf_len(pkt->pkt_meta));
+  else
+    _meta[0] = '\0';
   snprintf(buf, sizeof(buf),
            "%s%spkt stream %d %s%s%s"
-           " dts %s pts %s"
-           " dur %d len %zu err %i%s",
+           " pcr %s dts %s pts %s"
+           " dur %d len %zu err %i%s%s",
            fmt ? fmt : "",
            fmt ? " (" : "",
            pkt->pkt_componentindex,
            streaming_component_type2txt(pkt->pkt_type),
            _type[0] ? " type " : "", _type,
+           pts_to_string(pkt->pkt_pcr, _pcr),
            pts_to_string(pkt->pkt_dts, _dts),
            pts_to_string(pkt->pkt_pts, _pts),
            pkt->pkt_duration,
            pktbuf_len(pkt->pkt_payload),
            pkt->pkt_err,
+           _meta,
            fmt ? ")" : "");
   tvhlogv(file, line, LOG_TRACE, subsys, buf, &args);
   va_end(args);
@@ -217,6 +235,22 @@ pktref_enqueue(struct th_pktref_queue *q, th_pkt_t *pkt)
 
 
 /**
+ * Reference count is transfered to queue
+ */
+void
+pktref_enqueue_sorted(struct th_pktref_queue *q, th_pkt_t *pkt,
+                      int (*cmp)(const void *, const void *))
+{
+  th_pktref_t *pr = malloc(sizeof(th_pktref_t));
+  if (pr) {
+    pr->pr_pkt = pkt;
+    TAILQ_INSERT_SORTED(q, pr, pr_link, cmp);
+    memoryinfo_alloc(&pktref_memoryinfo, sizeof(*pr));
+  }
+}
+
+
+/**
  *
  */
 void
@@ -229,6 +263,20 @@ pktref_remove(struct th_pktref_queue *q, th_pktref_t *pr)
     free(pr);
     memoryinfo_free(&pktref_memoryinfo, sizeof(*pr));
   }
+}
+
+/**
+ *
+ */
+th_pkt_t *
+pktref_first(struct th_pktref_queue *q)
+{
+  th_pktref_t *pr;
+
+  pr = TAILQ_FIRST(q);
+  if (pr)
+    return pr->pr_pkt;
+  return NULL;
 }
 
 /**
@@ -314,26 +362,28 @@ pktbuf_ref_inc(pktbuf_t *pb)
 }
 
 pktbuf_t *
-pktbuf_alloc(const void *data, size_t size)
+pktbuf_alloc(const uint8_t *data, size_t size)
 {
-  pktbuf_t *pb = malloc(sizeof(pktbuf_t));
+  pktbuf_t *pb;
+  uint8_t *buffer;
 
-  if (pb == NULL) return NULL;
+  buffer = size > 0 ? malloc(size) : NULL;
+  if (buffer) {\
+    if (data != NULL)
+      memcpy(buffer, data, size);
+  } else if (size > 0) {
+    return NULL;
+  }
+  pb = malloc(sizeof(pktbuf_t));
+  if (pb == NULL) {
+    free(buffer);
+    return NULL;
+  }
   pb->pb_refcount = 1;
+  pb->pb_data = buffer;
   pb->pb_size = size;
   pb->pb_err = 0;
-  if(size > 0) {
-    pb->pb_data = malloc(size);
-    if (pb->pb_data != NULL) {
-      if (data != NULL)
-        memcpy(pb->pb_data, data, size);
-    } else {
-      pb->pb_size = 0;
-    }
-  } else {
-    pb->pb_data = NULL;
-  }
-  memoryinfo_alloc(&pktbuf_memoryinfo, sizeof(*pb) + pb->pb_size);
+  memoryinfo_alloc(&pktbuf_memoryinfo, sizeof(*pb) + size);
   return pb;
 }
 

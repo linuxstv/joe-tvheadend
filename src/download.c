@@ -114,7 +114,7 @@ download_fetch_complete(http_client_t *hc)
       last_url++;
   }
 
-  pthread_mutex_lock(&global_lock);
+  tvh_mutex_lock(&global_lock);
 
   if (dn->http_client == NULL)
     goto out;
@@ -129,7 +129,7 @@ download_fetch_complete(http_client_t *hc)
   mtimer_arm_rel(&dn->fetch_timer, download_fetch_done, hc, 0);
 
 out:
-  pthread_mutex_unlock(&global_lock);
+  tvh_mutex_unlock(&global_lock);
 
   urlreset(&u);
   return 0;
@@ -172,7 +172,7 @@ download_pipe_read(void *aux)
     sbuf_alloc(&dn->pipe_sbuf, 2048);
     len = sbuf_read(&dn->pipe_sbuf, dn->pipe_fd);
     if (len == 0) {
-      s = dn->url ? strdupa(dn->url) : strdupa("");
+      s = dn->url ? tvh_strdupa(dn->url) : tvh_strdupa("");
       p = strchr(s, ' ');
       if (p)
         *p = '\0';
@@ -248,7 +248,7 @@ download_fetch(void *aux)
     goto done;
 
   if (strncmp(dn->url, "file://", 7) == 0) {
-    char *f = strdupa(dn->url + 7);
+    char *f = tvh_strdupa(dn->url + 7);
     http_deescape(f);
     download_file(dn, f);
     goto done;

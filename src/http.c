@@ -16,22 +16,6 @@
  *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <pthread.h>
-#include <assert.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdarg.h>
-#include <ctype.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <signal.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <openssl/md5.h>
-
 #include "tvheadend.h"
 #include "tcp.h"
 #include "http.h"
@@ -39,6 +23,10 @@
 #include "notify.h"
 #include "channels.h"
 #include "config.h"
+#include "htsmsg_json.h"
+#include "compat.h"
+
+#include "openssl/opensslv.h"
 
 #if ENABLE_ANDROID
 #include <sys/socket.h>
@@ -47,7 +35,7 @@
 void *http_server;
 static int http_server_running;
 
-static pthread_mutex_t http_paths_mutex = PTHREAD_MUTEX_INITIALIZER;
+static tvh_mutex_t http_paths_mutex = TVH_THREAD_MUTEX_INITIALIZER;
 static http_path_list_t http_paths;
 
 static struct strtab HTTP_cmdtab[] = {
@@ -123,7 +111,7 @@ http_resolve(http_connection_t *hc, http_path_t *_hp,
 
   while (1) {
 
-    pthread_mutex_lock(hc->hc_paths_mutex);
+    tvh_mutex_lock(hc->hc_paths_mutex);
     LIST_FOREACH(hp, hc->hc_paths, hp_link) {
       if(!strncmp(path, hp->hp_path, hp->hp_len)) {
         if(path[hp->hp_len] == 0 ||
@@ -136,7 +124,7 @@ http_resolve(http_connection_t *hc, http_path_t *_hp,
       *_hp = *hp;
       hp = _hp;
     }
-    pthread_mutex_unlock(hc->hc_paths_mutex);
+    tvh_mutex_unlock(hc->hc_paths_mutex);
 
     if(hp == NULL)
       return 0;
@@ -179,6 +167,7 @@ http_resolve(http_connection_t *hc, http_path_t *_hp,
     break;
 
   case '?':
+    *v = 0; /* terminate remaining url */
     *argsp = v + 1;
     break;
 
@@ -199,6 +188,7 @@ static const char *
 http_rc2str(int code)
 {
   switch(code) {
+  case HTTP_STATUS_PSWITCH:         /* 101 */ return "Switching Protocols";
   case HTTP_STATUS_OK:              /* 200 */ return "OK";
   case HTTP_STATUS_PARTIAL_CONTENT: /* 206 */ return "Partial Content";
   case HTTP_STATUS_FOUND:           /* 302 */ return "Found";
@@ -233,7 +223,7 @@ static const char *cachemonths[12] = {
 typedef struct http_nonce {
   RB_ENTRY(http_nonce) link;
   mtimer_t expire;
-  char nonce[MD5_DIGEST_LENGTH*2+1];
+  char nonce[64];
 } http_nonce_t;
 
 static RB_HEAD(, http_nonce) http_nonces;
@@ -253,30 +243,46 @@ http_nonce_timeout(void *aux)
 }
 
 static char *
-http_get_nonce(void)
+http_get_digest_hash(int algo, const char *msg)
+{
+  switch (algo) {
+  case HTTP_AUTH_ALGO_MD5:
+    return md5sum(msg, 1);
+  case HTTP_AUTH_ALGO_SHA256:
+    return sha256sum(msg, 1);
+  default:
+    return sha512sum256(msg, 1);
+  }
+}
+
+static int
+http_get_nonce(http_connection_t *hc)
 {
   struct http_nonce *n = calloc(1, sizeof(*n));
   char stamp[33], *m;
   int64_t mono;
+  static int64_t xor;
 
   while (1) {
     mono = getmonoclock();
     mono ^= 0xa1687211885fcd30LL;
-    snprintf(stamp, sizeof(stamp), "%"PRId64, mono);
-    m = md5sum(stamp, 1);
-    strncpy(n->nonce, m, sizeof(stamp));
-    n->nonce[sizeof(stamp)-1] = '\0';
-    pthread_mutex_lock(&global_lock);
+    xor ^= 0xf6e398624aa55013LL;
+    snprintf(stamp, sizeof(stamp), "A!*Fz32%"PRId64"%"PRId64, mono, xor);
+    m = sha256sum_base64(stamp);
+    if (m == NULL) return -1;
+    strlcpy(n->nonce, m, sizeof(n->nonce));
+    tvh_mutex_lock(&global_lock);
     if (RB_INSERT_SORTED(&http_nonces, n, link, http_nonce_cmp)) {
-      pthread_mutex_unlock(&global_lock);
+      tvh_mutex_unlock(&global_lock);
       free(m);
-      continue; /* get unique md5 */
+      continue; /* get unique hash */
     }
     mtimer_arm_rel(&n->expire, http_nonce_timeout, n, sec2mono(30));
-    pthread_mutex_unlock(&global_lock);
+    tvh_mutex_unlock(&global_lock);
     break;
   }
-  return m;
+  hc->hc_nonce = m;
+  return 0;
 }
 
 static int
@@ -286,26 +292,50 @@ http_nonce_exists(const char *nonce)
 
   if (nonce == NULL)
     return 0;
-  strncpy(tmp.nonce, nonce, sizeof(tmp.nonce)-1);
-  tmp.nonce[sizeof(tmp.nonce)-1] = '\0';
-  pthread_mutex_lock(&global_lock);
+  strlcpy(tmp.nonce, nonce, sizeof(tmp.nonce));
+  tvh_mutex_lock(&global_lock);
   n = RB_FIND(&http_nonces, &tmp, link, http_nonce_cmp);
   if (n) {
     mtimer_arm_rel(&n->expire, http_nonce_timeout, n, sec2mono(2*60));
-    pthread_mutex_unlock(&global_lock);
+    tvh_mutex_unlock(&global_lock);
     return 1;
   }
-  pthread_mutex_unlock(&global_lock);
+  tvh_mutex_unlock(&global_lock);
   return 0;
 }
 
 static char *
-http_get_opaque(const char *realm, const char *nonce)
+http_get_opaque(http_connection_t *hc, const char *realm)
 {
-  char *a = alloca(strlen(realm) + strlen(nonce) + 1);
+  char *a = alloca(strlen(realm) + strlen(hc->hc_nonce) + 1);
   strcpy(a, realm);
-  strcat(a, nonce);
-  return md5sum(a, 1);
+  strcat(a, hc->hc_nonce);
+  return sha256sum_base64(a);
+}
+
+/**
+ *
+ */
+void
+http_alive(http_connection_t *hc)
+{
+  if (hc->hc_nonce)
+    http_nonce_exists(hc->hc_nonce); /* update timer */
+}
+
+/**
+ *
+ */
+static void
+http_auth_header
+  (htsbuf_queue_t *hdrs, const char *realm, const char *algo,
+   const char *nonce, const char *opaque)
+{
+  htsbuf_qprintf(hdrs, "WWW-Authenticate: Digest realm=\"%s\", qop=auth", realm);
+  if (algo)
+    htsbuf_qprintf(hdrs, ", algorithm=%s", algo);
+  htsbuf_qprintf(hdrs, ", nonce=\"%s\"", nonce);
+  htsbuf_qprintf(hdrs, ", opaque=\"%s\"\r\n", opaque);
 }
 
 /**
@@ -325,7 +355,7 @@ http_send_header(http_connection_t *hc, int rc, const char *content,
   time_t t;
   int sess = 0;
 
-  lock_assert(&hc->hc_fd_lock);
+  assert(atomic_get(&hc->hc_extra_insend) > 0);
 
   htsbuf_queue_init(&hdrs, 0);
 
@@ -333,11 +363,12 @@ http_send_header(http_connection_t *hc, int rc, const char *content,
 		 http_ver2str(hc->hc_version), rc, http_rc2str(rc));
 
   if (hc->hc_version != RTSP_VERSION_1_0){
-    htsbuf_append_str(&hdrs, "Server: HTS/tvheadend\r\n");
+    htsbuf_qprintf(&hdrs, "Server: %s\r\n", config_get_http_server_name());
     if (config.cors_origin && config.cors_origin[0]) {
-      htsbuf_qprintf(&hdrs, "Access-Control-Allow-Origin: %s\r\n", config.cors_origin);
-      htsbuf_append_str(&hdrs, "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n");
-      htsbuf_append_str(&hdrs, "Access-Control-Allow-Headers: x-requested-with,authorization\r\n");
+      htsbuf_qprintf(&hdrs, "Access-Control-Allow-Origin: %s\r\n%s%s%s", config.cors_origin,
+                            "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n",
+                            "Access-Control-Allow-Headers: x-requested-with,authorization\r\n",
+                            "Access-Control-Allow-Credentials: true\r\n");
     }
   }
   
@@ -367,27 +398,30 @@ http_send_header(http_connection_t *hc, int rc, const char *content,
   }
 
   if(rc == HTTP_STATUS_UNAUTHORIZED) {
-    const char *realm = config.realm;
-    if (realm == NULL || realm[0] == '\0')
-      realm = "tvheadend";
-    if (config.digest) {
-      if (hc->hc_nonce == NULL)
-        hc->hc_nonce = http_get_nonce();
-      char *opaque = http_get_opaque(realm, hc->hc_nonce);
-      htsbuf_append_str(&hdrs, "WWW-Authenticate: Digest realm=\"");
-      htsbuf_append_str(&hdrs, realm);
-      htsbuf_append_str(&hdrs, "\", qop=\"auth\", nonce=\"");
-      htsbuf_append_str(&hdrs, hc->hc_nonce);
-      htsbuf_append_str(&hdrs, "\", opaque=\"");
-      htsbuf_append_str(&hdrs, opaque);
-      htsbuf_append_str(&hdrs, "\"\r\n");
+    const char *realm = tvh_str_default(config.realm, "tvheadend");
+    if (config.http_auth == HTTP_AUTH_DIGEST ||
+        config.http_auth == HTTP_AUTH_PLAIN_DIGEST) {
+      char *opaque;
+      if (hc->hc_nonce == NULL && http_get_nonce(hc)) goto __noauth;
+      opaque = http_get_opaque(hc, realm);
+      if (opaque == NULL) goto __noauth;
+      if (config.http_auth_algo != HTTP_AUTH_ALGO_MD5)
+        http_auth_header(&hdrs, realm,
+                         config.http_auth_algo == HTTP_AUTH_ALGO_SHA256 ?
+                           "SHA-256" :
+#if OPENSSL_VERSION_NUMBER >= 0x1010101fL
+                             "SHA-512-256",
+#else
+                             "SHA-256",
+#endif
+                           hc->hc_nonce, opaque);
+      http_auth_header(&hdrs, realm, NULL, hc->hc_nonce, opaque);
       free(opaque);
     } else {
-      htsbuf_append_str(&hdrs, "WWW-Authenticate: Basic realm=\"");
-      htsbuf_append_str(&hdrs, realm);
-      htsbuf_append_str(&hdrs, "\"\r\n");
+      htsbuf_qprintf(&hdrs, "WWW-Authenticate: Basic realm=\"%s\"\r\n", realm);
     }
   }
+__noauth:
 
   if (hc->hc_version != RTSP_VERSION_1_0)
     htsbuf_qprintf(&hdrs, "Connection: %s\r\n",
@@ -437,6 +471,46 @@ http_send_header(http_connection_t *hc, int rc, const char *content,
 }
 
 /*
+ * Transmit a websocket upgrade reply
+ */
+int
+http_send_header_websocket(http_connection_t *hc, const char *protocol)
+{
+  htsbuf_queue_t hdrs;
+  const int rc = HTTP_STATUS_PSWITCH;
+  uint8_t hash[20];
+  const char *s;
+  const char *guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+  char encoded[512];
+
+  s = http_arg_get(&hc->hc_args, "sec-websocket-key");
+  if (s == NULL || strlen(s) < 10) {
+    http_error(hc, HTTP_STATUS_UNSUPPORTED);
+    return -1;
+  }
+
+  htsbuf_queue_init(&hdrs, 0);
+
+  htsbuf_qprintf(&hdrs, "%s %d %s\r\n",
+		 http_ver2str(hc->hc_version), rc, http_rc2str(rc));
+
+  sha1_calc(hash, (uint8_t *)s, strlen(s), (uint8_t *)guid, strlen(guid));
+  base64_encode(encoded, sizeof(encoded), hash, sizeof(hash));
+
+  htsbuf_qprintf(&hdrs, "Upgrade: websocket\r\n"
+                        "Connection: Upgrade\r\n"
+                        "Sec-WebSocket-Accept: %s\r\n"
+                        "Sec-WebSocket-Protocol: %s\r\n"
+                        "\r\n",
+                        encoded, protocol);
+
+  http_send_begin(hc);
+  tcp_write_queue(hc->hc_fd, &hdrs);
+  http_send_end(hc);
+  return 0;
+}
+
+/*
  *
  */
 int
@@ -474,22 +548,20 @@ http_encoding_valid(http_connection_t *hc, const char *encoding)
 /**
  *
  */
-static char *
-http_get_header_value(const char *hdr, const char *name)
+int
+http_header_match(http_connection_t *hc, const char *name, const char *value)
 {
   char *tokbuf, *tok, *saveptr = NULL, *q, *s;
 
-  tokbuf = tvh_strdupa(hdr);
+  s = http_arg_get(&hc->hc_args, name);
+  if (s == NULL)
+    return 0;
+  tokbuf = tvh_strdupa(s);
   tok = strtok_r(tokbuf, ",", &saveptr);
   while (tok) {
     while (*tok == ' ')
       tok++;
-    if ((q = strchr(tok, '=')) == NULL)
-      goto next;
-    *q = '\0';
-    if (strcasecmp(tok, name))
-      goto next;
-    s = q + 1;
+    s = tok;
     if (*s == '"') {
       q = strchr(++s, '"');
       if (q)
@@ -499,11 +571,62 @@ http_get_header_value(const char *hdr, const char *name)
       if (q)
         *q = '\0';
     }
-    return strdup(s);
-next:
+    if (strcasecmp(s, value) == 0)
+      return 1;
     tok = strtok_r(NULL, ",", &saveptr);
   }
+  return 0;
+}
+
+/**
+ *
+ */
+static char *
+http_get_header_value(const char *hdr, const char *name)
+{
+  char *s, *start, *val;
+  s = tvh_strdupa(hdr);
+  while (*s) {
+    while (*s && *s <= ' ') s++;
+    start = s;
+    while (*s && *s != '=') s++;
+    if (*s == '=') {
+      *s = '\0';
+      s++;
+    }
+    while (*s && *s <= ' ') s++;
+    if (*s == '"') {
+      val = ++s;
+      while (*s && *s != '"') s++;
+      if (*s == '"') {
+        *s = '\0';
+        s++;
+      }
+      while (*s && (*s <= ' ' || *s == ',')) s++;
+    } else {
+      val = s;
+      while (*s && *s != ',') s++;
+      *s = '\0';
+      s++;
+    }
+    if (*start && strcmp(name, start) == 0)
+      return strdup(val);
+  }
   return NULL;
+}
+
+/**
+ *
+ */
+int
+http_check_local_ip( http_connection_t *hc )
+{
+  if (hc->hc_local_ip == NULL) {
+    hc->hc_local_ip = malloc(sizeof(*hc->hc_local_ip));
+    *hc->hc_local_ip = *hc->hc_self;
+    hc->hc_is_local_ip = ip_check_is_local_address(hc->hc_peer, hc->hc_self, hc->hc_local_ip) > 0;
+  }
+  return hc->hc_is_local_ip;
 }
 
 /**
@@ -525,7 +648,7 @@ http_send_reply(http_connection_t *hc, int rc, const char *content,
   }
 #endif
 
-  pthread_mutex_lock(&hc->hc_fd_lock);
+  http_send_begin(hc);
   http_send_header(hc, rc, content, size,
 		   encoding, location, maxage, 0, NULL, NULL);
   
@@ -535,7 +658,7 @@ http_send_reply(http_connection_t *hc, int rc, const char *content,
     else
       tvh_write(hc->hc_fd, data, size);
   }
-  pthread_mutex_unlock(&hc->hc_fd_lock);
+  http_send_end(hc);
 
   free(data);
 }
@@ -559,9 +682,9 @@ http_error(http_connection_t *hc, int error)
       level = LOG_DEBUG;
     else if (error == HTTP_STATUS_BAD_REQUEST || error > HTTP_STATUS_UNAUTHORIZED)
       level = LOG_ERR;
-    tvhlog(level, LS_HTTP, "%s: %s %s %s -- %d",
+    tvhlog(level, hc->hc_subsys, "%s: %s %s (%d) %s -- %d",
 	   hc->hc_peer_ipstr, http_ver2str(hc->hc_version),
-           http_cmd2str(hc->hc_cmd), hc->hc_url, error);
+           http_cmd2str(hc->hc_cmd), hc->hc_cmd, hc->hc_url, error);
   }
 
   if (hc->hc_version != RTSP_VERSION_1_0) {
@@ -576,7 +699,7 @@ http_error(http_connection_t *hc, int error)
                    error, errtxt, error, errtxt);
 
     if (error == HTTP_STATUS_UNAUTHORIZED) {
-      lang = tvh_gettext_get_lang(hc->hc_access ? hc->hc_access->aa_lang_ui : NULL);
+      lang = hc->hc_access ? hc->hc_access->aa_lang_ui : NULL;
       htsbuf_qprintf(&hc->hc_reply, "<P STYLE=\"text-align: center; margin: 2em\"><A HREF=\"%s/\" STYLE=\"border: 1px solid; border-radius: 4px; padding: .6em\">%s</A></P>",
                      tvheadend_webroot ? tvheadend_webroot : "",
                      tvh_gettext_lang(lang, N_("Default login")));
@@ -693,20 +816,150 @@ http_css_import(http_connection_t *hc, const char *location)
 /**
  *
  */
-char *
-http_get_hostpath(http_connection_t *hc)
+void
+http_extra_destroy(http_connection_t *hc)
 {
-  char buf[256];
+  htsbuf_data_t *hd, *hd_next;
+
+  tvh_mutex_lock(&hc->hc_extra_lock);
+  for (hd = TAILQ_FIRST(&hc->hc_extra.hq_q); hd; hd = hd_next) {
+    hd_next = TAILQ_NEXT(hd, hd_link);
+    if (hd->hd_data_off <= 0) {
+      htsbuf_data_free(&hc->hc_extra, hd);
+      atomic_dec(&hc->hc_extra_chunks, 1);
+    }
+  }
+  tvh_mutex_unlock(&hc->hc_extra_lock);
+}
+
+/**
+ *
+ */
+int
+http_extra_flush(http_connection_t *hc)
+{
+  htsbuf_data_t *hd;
+  int r, serr = 0;
+
+  if (atomic_add(&hc->hc_extra_insend, 1) != 0)
+    goto fin;
+
+  while (1) {
+    r = -1;
+    serr = 0;
+    tvh_mutex_lock(&hc->hc_extra_lock);
+    if (atomic_add(&hc->hc_extra_insend, 0) != 1)
+      goto unlock;
+    hd = TAILQ_FIRST(&hc->hc_extra.hq_q);
+    if (hd == NULL)
+      goto unlock;
+    do {
+      r = send(hc->hc_fd, hd->hd_data + hd->hd_data_off,
+               hd->hd_data_size - hd->hd_data_off,
+               MSG_DONTWAIT | (TAILQ_NEXT(hd, hd_link) ? MSG_MORE : 0));
+      serr = errno;
+    } while (r < 0 && serr == EINTR);
+    if (r > 0 && r + hd->hd_data_off >= hd->hd_data_size) {
+      atomic_dec(&hc->hc_extra_chunks, 1);
+      htsbuf_data_free(&hc->hc_extra, hd);
+    } else if (r > 0) {
+      hd->hd_data_off += r;
+      hc->hc_extra.hq_size -= r;
+    }
+unlock:
+    tvh_mutex_unlock(&hc->hc_extra_lock);
+
+    if (r < 0) {
+      if (ERRNO_AGAIN(serr))
+        serr = 0;
+      break;
+    }
+  }
+
+fin:
+  atomic_dec(&hc->hc_extra_insend, 1);
+  return serr;
+}
+
+/**
+ *
+ */
+int
+http_extra_flush_partial(http_connection_t *hc)
+{
+  htsbuf_data_t *hd;
+  int r = 0;
+  unsigned int off, size;
+  void *data = NULL;
+
+  atomic_add(&hc->hc_extra_insend, 1);
+
+  tvh_mutex_lock(&hc->hc_extra_lock);
+  hd = TAILQ_FIRST(&hc->hc_extra.hq_q);
+  if (hd && hd->hd_data_off > 0) {
+    data = hd->hd_data;
+    hd->hd_data = NULL;
+    off = hd->hd_data_off;
+    size = hd->hd_data_size;
+    atomic_dec(&hc->hc_extra_chunks, 1);
+    htsbuf_data_free(&hc->hc_extra, hd);
+  }
+  tvh_mutex_unlock(&hc->hc_extra_lock);
+  if (data) {
+    r = tvh_write(hc->hc_fd, data + off, size - off);
+    free(data);
+  }
+  atomic_dec(&hc->hc_extra_insend, 1);
+  return r;
+}
+
+/**
+ *
+ */
+int
+http_extra_send(http_connection_t *hc, const void *data,
+                size_t data_len, int may_discard)
+{
+  uint8_t *b = malloc(data_len);
+  memcpy(b, data, data_len);
+  return http_extra_send_prealloc(hc, b, data_len, may_discard);
+}
+
+/**
+ *
+ */
+int
+http_extra_send_prealloc(http_connection_t *hc, const void *data,
+                         size_t data_len, int may_discard)
+{
+  if (data == NULL) return 0;
+  tvh_mutex_lock(&hc->hc_extra_lock);
+  if (!may_discard || hc->hc_extra.hq_size <= 1024*1024) {
+    atomic_add(&hc->hc_extra_chunks, 1);
+    htsbuf_append_prealloc(&hc->hc_extra, data, data_len);
+  } else {
+    free((void *)data);
+  }
+  tvh_mutex_unlock(&hc->hc_extra_lock);
+  return http_extra_flush(hc);
+}
+
+/**
+ *
+ */
+char *
+http_get_hostpath(http_connection_t *hc, char *buf, size_t buflen)
+{
   const char *host, *proto;
 
   host  = http_arg_get(&hc->hc_args, "Host") ?:
           http_arg_get(&hc->hc_args, "X-Forwarded-Host");
   proto = http_arg_get(&hc->hc_args, "X-Forwarded-Proto");
 
-  snprintf(buf, sizeof(buf), "%s://%s%s",
+  snprintf(buf, buflen, "%s://%s%s",
            proto ?: "http", host ?: "localhost", tvheadend_webroot ?: "");
 
-  return strdup(buf);
+  return buf;
 }
 
 /**
@@ -717,14 +970,30 @@ http_access_verify_ticket(http_connection_t *hc)
 {
   const char *ticket_id;
 
-  if (hc->hc_access)
-    return;
   ticket_id = http_arg_get(&hc->hc_req_args, "ticket");
   hc->hc_access = access_ticket_verify2(ticket_id, hc->hc_url);
   if (hc->hc_access == NULL)
     return;
-  tvhinfo(LS_HTTP, "%s: using ticket %s for %s",
+  hc->hc_auth_type = HC_AUTH_TICKET;
+  tvhinfo(hc->hc_subsys, "%s: using ticket %s for %s",
 	  hc->hc_peer_ipstr, ticket_id, hc->hc_url);
+}
+
+/**
+ *
+ */
+static void
+http_access_verify_auth(http_connection_t *hc)
+{
+  const char *auth_id;
+
+  auth_id = http_arg_get(&hc->hc_req_args, "auth");
+  hc->hc_access = access_get_by_auth(hc->hc_peer, auth_id);
+  if (hc->hc_access == NULL)
+    return;
+  hc->hc_auth_type = HC_AUTH_PERM;
+  tvhinfo(hc->hc_subsys, "%s: using auth %s for %s",
+	  hc->hc_peer_ipstr, auth_id, hc->hc_url);
 }
 
 /**
@@ -735,6 +1004,7 @@ struct http_verify_structure {
   char *d_ha1;
   char *d_all;
   char *d_response;
+  int algo;
   http_connection_t *hc;
 };
 
@@ -749,10 +1019,10 @@ http_verify_callback(void *aux, const char *passwd)
 
    if (v->d_ha1) {
      snprintf(ha1, sizeof(ha1), "%s:%s", v->d_ha1, passwd);
-     m = md5sum(ha1, 1);
+     m = http_get_digest_hash(v->algo, ha1);
      snprintf(all, sizeof(all), "%s:%s", m, v->d_all);
      free(m);
-     m = md5sum(all, 1);
+     m = http_get_digest_hash(v->algo, all);
      res = strcmp(m, v->d_response) == 0;
      free(m);
      return res;
@@ -777,15 +1047,26 @@ http_verify_prepare(http_connection_t *hc, struct http_verify_structure *v)
     char *response = http_get_header_value(hc->hc_authhdr, "response");
     char *qop = http_get_header_value(hc->hc_authhdr, "qop");
     char *uri = http_get_header_value(hc->hc_authhdr, "uri");
+    char *algo1 = http_get_header_value(hc->hc_authhdr, "algorithm");
     char *realm = NULL, *nonce_count = NULL, *cnonce = NULL, *m = NULL;
     char all[1024];
     int res = -1;
+
+    if (algo1 == NULL || strcasecmp(algo1, "MD5") == 0) {
+      v->algo = HTTP_AUTH_ALGO_MD5;
+    } else if (strcasecmp(algo1, "SHA-256") == 0) {
+      v->algo = HTTP_AUTH_ALGO_SHA256;
+    } else if (strcasecmp(algo1, "SHA-512-256") == 0) {
+      v->algo = HTTP_AUTH_ALGO_SHA512_256;
+    } else {
+      goto end;
+    }
 
     if (qop == NULL || uri == NULL)
       goto end;
      
     if (strcasecmp(qop, "auth-int") == 0) {
-      m = md5sum(hc->hc_post_data ?: "", 1);
+      m = http_get_digest_hash(v->algo, hc->hc_post_data ?: "");
       snprintf(all, sizeof(all), "%s:%s:%s", method, uri, m);
       free(m);
       m = NULL;
@@ -795,15 +1076,16 @@ http_verify_prepare(http_connection_t *hc, struct http_verify_structure *v)
       goto end;
     }
 
-    m = md5sum(all, 1);
-    if (qop == NULL || *qop == '\0') {
+    m = http_get_digest_hash(v->algo, all);
+    if (tvh_str_default(qop, NULL) == NULL) {
       snprintf(all, sizeof(all), "%s:%s", hc->hc_nonce, m);
       goto set;
     } else {
       realm = http_get_header_value(hc->hc_authhdr, "realm");
       nonce_count = http_get_header_value(hc->hc_authhdr, "nc");
       cnonce = http_get_header_value(hc->hc_authhdr, "cnonce");
-      if (realm == NULL || nonce_count == NULL || cnonce == NULL) {
+      if (realm == NULL || strcmp(realm, config.realm) ||
+          nonce_count == NULL || cnonce == NULL) {
         goto end;
       } else {
         snprintf(all, sizeof(all), "%s:%s:%s:%s:%s",
@@ -851,26 +1133,41 @@ int
 http_access_verify(http_connection_t *hc, int mask)
 {
   struct http_verify_structure v;
-  int res = -1;
+  int r;
 
-  http_access_verify_ticket(hc);
+  /* quick path */
   if (hc->hc_access)
-    res = access_verify2(hc->hc_access, mask);
+    return access_verify2(hc->hc_access, mask);
 
-  if (res) {
-    access_destroy(hc->hc_access);
-    if (http_verify_prepare(hc, &v)) {
-      hc->hc_access = NULL;
-      return -1;
+  /* tickets */
+  http_access_verify_ticket(hc);
+  if (hc->hc_access && !access_verify2(hc->hc_access, mask))
+    return 0;
+
+  http_access_verify_auth(hc);
+  if (hc->hc_access && !access_verify2(hc->hc_access, mask))
+    return 0;
+
+  access_destroy(hc->hc_access);
+  if (http_verify_prepare(hc, &v)) {
+    hc->hc_access = NULL;
+    return -1;
+  }
+  hc->hc_access = access_get(hc->hc_peer, hc->hc_username,
+                             http_verify_callback, &v);
+  http_verify_free(&v);
+  if (hc->hc_access) {
+    r = access_verify2(hc->hc_access, mask);
+    if (r == 0) {
+      if (!strempty(hc->hc_username))
+        hc->hc_auth_type = hc->hc_authhdr ? HC_AUTH_DIGEST : HC_AUTH_PLAIN;
+      else
+        hc->hc_auth_type = HC_AUTH_ADDR;
     }
-    hc->hc_access = access_get(hc->hc_peer, hc->hc_username,
-                               http_verify_callback, &v);
-    http_verify_free(&v);
-    if (hc->hc_access)
-      res = access_verify2(hc->hc_access, mask);
+    return r;
   }
 
-  return res;
+  return -1;
 }
 
 /**
@@ -880,38 +1177,43 @@ int
 http_access_verify_channel(http_connection_t *hc, int mask,
                            struct channel *ch)
 {
-  struct http_verify_structure v;
-  int res = -1;
+  if (http_access_verify(hc, mask))
+    return -1;
 
-  assert(ch);
+  return channel_access(ch, hc->hc_access, 0) ? 0 : -1;
+}
 
-  http_access_verify_ticket(hc);
-  if (hc->hc_access) {
-    res = access_verify2(hc->hc_access, mask);
+/**
+ *
+ */
+const char *
+http_username(http_connection_t *hc)
+{
+  if (strempty(hc->hc_username) && hc->hc_access)
+    return hc->hc_access->aa_username;
+  return hc->hc_username;
+}
 
-    if (!res && !channel_access(ch, hc->hc_access, 0))
-      res = -1;
-  }
+/**
+ *
+ */
+int
+http_noaccess_code(http_connection_t *hc)
+{
+  return strempty(hc->hc_username) ?
+              HTTP_STATUS_UNAUTHORIZED : HTTP_STATUS_FORBIDDEN;
+}
 
-  if (res) {
-    access_destroy(hc->hc_access);
-    if (http_verify_prepare(hc, &v)) {
-      hc->hc_access = NULL;
-      return -1;
-    }
-    hc->hc_access = access_get(hc->hc_peer, hc->hc_username,
-                               http_verify_callback, &v);
-    http_verify_free(&v);
-    if (hc->hc_access) {
-      res = access_verify2(hc->hc_access, mask);
-
-      if (!res && !channel_access(ch, hc->hc_access, 0))
-        res = -1;
-    }
-  }
-
-
-  return res;
+/**
+ *
+ */
+static int
+http_websocket_valid(http_connection_t *hc)
+{
+  if (!http_header_match(hc, "connection", "upgrade") ||
+      http_arg_get(&hc->hc_args, "sec-websocket-key") == NULL)
+    return HTTP_STATUS_UNSUPPORTED;
+  return 0;
 }
 
 /**
@@ -925,12 +1227,16 @@ http_exec(http_connection_t *hc, http_path_t *hp, char *remain)
 {
   int err;
 
-  if ((hc->hc_username && hc->hc_username[0] == '\0') ||
-      http_access_verify(hc, hp->hp_accessmask)) {
-    if (!hp->hp_no_verification) {
-      err = HTTP_STATUS_UNAUTHORIZED;
+  if (http_access_verify(hc, hp->hp_accessmask)) {
+    if ((hp->hp_flags & HTTP_PATH_NO_VERIFICATION) == 0) {
+      err = http_noaccess_code(hc);
       goto destroy;
     }
+  }
+  if (hp->hp_flags & HTTP_PATH_WEBSOCKET) {
+    err = http_websocket_valid(hc);
+    if (err)
+      goto destroy;
   }
   err = hp->hp_callback(hc, remain, hp->hp_opaque);
 destroy:
@@ -969,7 +1275,7 @@ dump_request(http_connection_t *hc)
   if (!first)
     tvh_strlcatf(buf, sizeof(buf), ptr, "}}");
 
-  tvhtrace(LS_HTTP, "%s %s %s%s", http_ver2str(hc->hc_version),
+  tvhtrace(hc->hc_subsys, "%s %s %s%s", http_ver2str(hc->hc_version),
            http_cmd2str(hc->hc_cmd), hc->hc_url, buf);
 }
 
@@ -979,10 +1285,10 @@ dump_request(http_connection_t *hc)
 static int
 http_cmd_options(http_connection_t *hc)
 {
-  pthread_mutex_lock(&hc->hc_fd_lock);
+  http_send_begin(hc);
   http_send_header(hc, HTTP_STATUS_OK, NULL, INT64_MIN,
 		   NULL, NULL, -1, 0, NULL, NULL);
-  pthread_mutex_unlock(&hc->hc_fd_lock);
+  http_send_end(hc);
   return 0;
 }
 
@@ -1109,8 +1415,17 @@ process_request(http_connection_t *hc, htsbuf_queue_t *spill)
   hc->hc_url_orig = tvh_strdupa(hc->hc_url);
 
   v = (config.proxy) ? http_arg_get(&hc->hc_args, "X-Forwarded-For") : NULL;
-  if (v)
-    tcp_get_ip_from_str(v, hc->hc_peer);
+  if (v) {
+    if (hc->hc_proxy_ip == NULL)
+      hc->hc_proxy_ip = malloc(sizeof(*hc->hc_proxy_ip));
+    *hc->hc_proxy_ip = *hc->hc_peer;
+    if (tcp_get_ip_from_str(v, hc->hc_peer) == NULL) {
+      http_error(hc, HTTP_STATUS_BAD_REQUEST);
+      free(hc->hc_proxy_ip);
+      hc->hc_proxy_ip = NULL;
+      return -1;
+    }
+  }
 
   tcp_get_str_from_ip(hc->hc_peer, authbuf, sizeof(authbuf));
 
@@ -1128,19 +1443,16 @@ process_request(http_connection_t *hc, htsbuf_queue_t *spill)
   case RTSP_VERSION_1_0:
     hc->hc_keep_alive = 1;
     /* Extract CSeq */
-    if((v = http_arg_get(&hc->hc_args, "CSeq")) != NULL)
+    if((v = http_arg_get(&hc->hc_args, "CSeq")) != NULL) {
       hc->hc_cseq = strtoll(v, NULL, 10);
-    else
+    } else {
       hc->hc_cseq = 0;
+    }
     free(hc->hc_session);
     if ((v = http_arg_get(&hc->hc_args, "Session")) != NULL)
       hc->hc_session = tvh_strdupa(v);
     else
       hc->hc_session = NULL;
-    if(hc->hc_cseq == 0) {
-      http_error(hc, HTTP_STATUS_BAD_REQUEST);
-      return -1;
-    }
     break;
 
   case HTTP_VERSION_1_0:
@@ -1158,34 +1470,46 @@ process_request(http_connection_t *hc, htsbuf_queue_t *spill)
   if((v = http_arg_get(&hc->hc_args, "Authorization")) != NULL) {
     if((n = http_tokenize(v, argv, 2, -1)) == 2) {
       if (strcasecmp(argv[0], "basic") == 0) {
-        n = base64_decode((uint8_t *)authbuf, argv[1], sizeof(authbuf) - 1);
-        if (n < 0)
-          n = 0;
-        authbuf[n] = 0;
-        if((n = http_tokenize(authbuf, argv, 2, ':')) == 2) {
-          hc->hc_username = tvh_strdupa(argv[0]);
-          hc->hc_password = tvh_strdupa(argv[1]);
-          http_deescape(hc->hc_username);
-          http_deescape(hc->hc_password);
-          // No way to actually track this
+        if (config.http_auth == HTTP_AUTH_PLAIN ||
+            config.http_auth == HTTP_AUTH_PLAIN_DIGEST) {
+          n = base64_decode((uint8_t *)authbuf, argv[1], sizeof(authbuf) - 1);
+          if (n < 0)
+            n = 0;
+          authbuf[n] = 0;
+          if((n = http_tokenize(authbuf, argv, 2, ':')) == 2) {
+            hc->hc_username = tvh_strdupa(argv[0]);
+            hc->hc_password = tvh_strdupa(argv[1]);
+            http_deescape(hc->hc_username);
+            http_deescape(hc->hc_password);
+            // No way to actually track this
+          } else {
+            http_error(hc, HTTP_STATUS_UNAUTHORIZED);
+            return -1;
+          }
         } else {
           http_error(hc, HTTP_STATUS_UNAUTHORIZED);
           return -1;
         }
       } else if (strcasecmp(argv[0], "digest") == 0) {
-        v = http_get_header_value(argv[1], "nonce");
-        if (v == NULL || !http_nonce_exists(v)) {
+        if (config.http_auth == HTTP_AUTH_DIGEST ||
+            config.http_auth == HTTP_AUTH_PLAIN_DIGEST) {
+          v = http_get_header_value(argv[1], "nonce");
+          if (v == NULL || !http_nonce_exists(v)) {
+            free(v);
+            http_error(hc, HTTP_STATUS_UNAUTHORIZED);
+            return -1;
+          }
+          free(hc->hc_nonce);
+          hc->hc_nonce = v;
+          v = http_get_header_value(argv[1], "username");
+          hc->hc_authhdr  = tvh_strdupa(argv[1]);
+          hc->hc_username = tvh_strdupa(v);
+          http_deescape(hc->hc_username);
           free(v);
+        } else {
           http_error(hc, HTTP_STATUS_UNAUTHORIZED);
           return -1;
         }
-        free(hc->hc_nonce);
-        hc->hc_nonce = v;
-        v = http_get_header_value(argv[1], "username");
-        hc->hc_authhdr  = tvh_strdupa(argv[1]);
-        hc->hc_username = tvh_strdupa(v);
-        http_deescape(hc->hc_username);
-        free(v);
       } else {
         http_error(hc, HTTP_STATUS_BAD_REQUEST);
         return -1;
@@ -1200,10 +1524,7 @@ process_request(http_connection_t *hc, htsbuf_queue_t *spill)
   case RTSP_VERSION_1_0:
     if (tvhtrace_enabled())
       dump_request(hc);
-    if (hc->hc_cseq)
-      rval = hc->hc_process(hc, spill);
-    else
-      http_error(hc, HTTP_STATUS_HTTP_VERSION);
+    rval = hc->hc_process(hc, spill);
     break;
 
   case HTTP_VERSION_1_0:
@@ -1236,7 +1557,7 @@ http_arg_remove(struct http_arg_list *list, struct http_arg *arg)
  * Delete all arguments associated with a connection
  */
 void
-http_arg_flush(struct http_arg_list *list)
+http_arg_flush(http_arg_list_t *list)
 {
   http_arg_t *ra;
   while((ra = TAILQ_FIRST(list)) != NULL)
@@ -1248,7 +1569,7 @@ http_arg_flush(struct http_arg_list *list)
  * Find an argument associated with a connection
  */
 char *
-http_arg_get(struct http_arg_list *list, const char *name)
+http_arg_get(http_arg_list_t *list, const char *name)
 {
   http_arg_t *ra;
   TAILQ_FOREACH(ra, list, link)
@@ -1263,17 +1584,15 @@ http_arg_get(struct http_arg_list *list, const char *name)
 char *
 http_arg_get_remove(struct http_arg_list *list, const char *name)
 {
-  static char __thread buf[128];
+  static __thread char buf[128];
   int empty;
   http_arg_t *ra;
   TAILQ_FOREACH(ra, list, link)
     if(!strcasecmp(ra->key, name)) {
       TAILQ_REMOVE(list, ra, link);
       empty = ra->val == NULL;
-      if (!empty) {
-        strncpy(buf, ra->val, sizeof(buf)-1);
-        buf[sizeof(buf)-1] = '\0';
-      }
+      if (!empty)
+        strlcpy(buf, ra->val, sizeof(buf));
       free(ra->key);
       free(ra->val);
       free(ra);
@@ -1296,6 +1615,34 @@ http_arg_set(struct http_arg_list *list, const char *key, const char *val)
   TAILQ_INSERT_TAIL(list, ra, link);
   ra->key = strdup(key);
   ra->val = val ? strdup(val) : NULL;
+}
+
+/*
+ *
+ */
+char *
+http_arg_get_query(http_arg_list_t *args)
+{
+  htsbuf_queue_t q;
+  http_arg_t *ra;
+  char *r;
+
+  if (http_args_empty(args))
+    return NULL;
+  htsbuf_queue_init(&q, 0);
+  htsbuf_queue_init(&q, 0);
+  TAILQ_FOREACH(ra, args, link) {
+    if (!htsbuf_empty(&q))
+      htsbuf_append(&q, "&", 1);
+    htsbuf_append_and_escape_url(&q, ra->key);
+    if (ra->val) {
+      htsbuf_append(&q, "=", 1);
+      htsbuf_append_and_escape_url(&q, ra->val);
+    }
+  }
+  r = htsbuf_to_string(&q);
+  htsbuf_queue_flush(&q);
+  return r;
 }
 
 /*
@@ -1346,10 +1693,10 @@ http_path_add_modify(const char *path, void *opaque, http_callback_t *callback,
   hp->hp_callback = callback;
   hp->hp_accessmask = accessmask;
   hp->hp_path_modify = path_modify;
-  hp->hp_no_verification = 0;
-  pthread_mutex_lock(&http_paths_mutex);
+  hp->hp_flags    = 0;
+  tvh_mutex_lock(&http_paths_mutex);
   LIST_INSERT_HEAD(&http_paths, hp, hp_link);
-  pthread_mutex_unlock(&http_paths_mutex);
+  tvh_mutex_unlock(&http_paths_mutex);
   return hp;
 }
 
@@ -1364,58 +1711,164 @@ http_path_add(const char *path, void *opaque, http_callback_t *callback,
 }
 
 /**
- * De-escape HTTP URL
+ *
  */
-void
-http_deescape(char *s)
+int
+http_websocket_send(http_connection_t *hc, uint8_t *buf, uint64_t buflen,
+                    int opcode)
 {
-  char v, *d = s;
+  int op, r = 0;
+  uint8_t b[10];
+  uint64_t bsize;
 
-  while(*s) {
-    if(*s == '+') {
-      *d++ = ' ';
-      s++;
-    } else if(*s == '%') {
-      s++;
-      switch(*s) {
-      case '0' ... '9':
-	v = (*s - '0') << 4;
-	break;
-      case 'a' ... 'f':
-	v = (*s - 'a' + 10) << 4;
-	break;
-      case 'A' ... 'F':
-	v = (*s - 'A' + 10) << 4;
-	break;
-      default:
-	*d = 0;
-	return;
-      }
-      s++;
-      switch(*s) {
-      case '0' ... '9':
-	v |= (*s - '0');
-	break;
-      case 'a' ... 'f':
-	v |= (*s - 'a' + 10);
-	break;
-      case 'A' ... 'F':
-	v |= (*s - 'A' + 10);
-	break;
-      default:
-	*d = 0;
-	return;
-      }
-      s++;
-
-      *d++ = v;
-    } else {
-      *d++ = *s++;
-    }
+  switch (opcode) {
+  case HTTP_WSOP_TEXT:   op = 0x01; break;
+  case HTTP_WSOP_BINARY: op = 0x02; break;
+  case HTTP_WSOP_PING:   op = 0x09; break;
+  case HTTP_WSOP_PONG:   op = 0x0a; break;
+  default: return -1;
   }
-  *d = 0;
+
+  b[0] = 0x80 | op; /* FIN + opcode */
+  if (buflen <= 125) {
+    b[1] = buflen;
+    bsize = 2;
+  } else if (buflen <= 65535) {
+    b[1] = 126;
+    b[2] = (buflen >> 8) & 0xff;
+    b[3] = buflen & 0xff;
+    bsize = 4;
+  } else {
+    b[1] = 127;
+    b[2] = (buflen >> 56) & 0xff;
+    b[3] = (buflen >> 48) & 0xff;
+    b[4] = (buflen >> 40) & 0xff;
+    b[5] = (buflen >> 32) & 0xff;
+    b[6] = (buflen >> 24) & 0xff;
+    b[7] = (buflen >> 16) & 0xff;
+    b[8] = (buflen >>  8) & 0xff;
+    b[9] = (buflen >>  0) & 0xff;
+    bsize = 10;
+  }
+  http_send_begin(hc);
+  if (tvh_write(hc->hc_fd, b, bsize))
+    r = -1;
+  if (r == 0 && tvh_write(hc->hc_fd, buf, buflen))
+    r = -1;
+  http_send_end(hc);
+  return r;
 }
 
+/**
+ *
+ */
+int
+http_websocket_send_json(http_connection_t *hc, htsmsg_t *msg)
+{
+  htsbuf_queue_t q;
+  char *s;
+  int r;
+
+  htsbuf_queue_init(&q, 0);
+  htsmsg_json_serialize(msg, &q, 0);
+  s = htsbuf_to_string(&q);
+  htsbuf_queue_flush(&q);
+  r = http_websocket_send(hc, (uint8_t *)s, strlen(s), HTTP_WSOP_TEXT);
+  free(s);
+  return r;
+}
+
+/**
+ *
+ */
+int
+http_websocket_read(http_connection_t *hc, htsmsg_t **_res, int timeout)
+{
+  htsmsg_t *msg, *msg1;
+  uint8_t b[2], bl[8], *p;
+  int op, r;
+  uint64_t plen, pi;
+
+  *_res = NULL;
+again:
+  r = tcp_read_timeout(hc->hc_fd, b, 2, timeout);
+  if (r == ETIMEDOUT)
+    return 0;
+  if (r)                  /* closed connection */
+    return -1;
+  if ((b[1] & 0x80) == 0) /* accept only masked messages */
+    return -1;
+  switch (b[0] & 0x0f) {  /* opcode */
+  case 0x0:               /* continuation */
+    goto again;
+  case 0x1:               /* text */
+    op = HTTP_WSOP_TEXT;
+    break;
+  case 0x2:               /* binary */
+    op = HTTP_WSOP_BINARY;
+    break;
+  case 0x8:               /* close connection */
+    return -1;
+  case 0x9:               /* ping */
+    op = HTTP_WSOP_PING;
+    break;
+  case 0xa:               /* pong */
+    op = HTTP_WSOP_PONG;
+    break;
+  default:
+    return -1;
+  }
+  plen = b[1] & 0x7f;
+  if (plen == 126) {
+    if (tcp_read(hc->hc_fd, bl, 2))
+      return -1;
+    plen = (bl[0] << 8) | bl[1];
+  } else if (plen == 127) {
+    if (tcp_read(hc->hc_fd, bl, 8))
+      return -1;
+    plen = ((uint64_t)bl[0] << 56) | ((uint64_t)bl[1] << 48) |
+           ((uint64_t)bl[2] << 40) | ((uint64_t)bl[3] << 32) |
+           ((uint64_t)bl[4] << 24) | ((uint64_t)bl[5] << 16) |
+           ((uint64_t)bl[6] << 8 ) | ((uint64_t)bl[7] << 0);
+  }
+  if (plen > 5*1024*1024)
+    return -1;
+  p = malloc(plen + 1);
+  if (p == NULL)
+    return -1;
+  if (tcp_read(hc->hc_fd, bl, 4))
+    goto err1;
+  if (tcp_read(hc->hc_fd, p, plen))
+    goto err1;
+  /* apply mask descrambling */
+  for (pi = 0; pi < plen; pi++)
+    p[pi] ^= bl[pi & 3];
+  if (op == HTTP_WSOP_PING) {
+    http_websocket_send(hc, p, plen, HTTP_WSOP_PONG);
+    free(p);
+    goto again;
+  }
+  msg = htsmsg_create_map();
+  htsmsg_add_s32(msg, "op", op);
+  if (op == HTTP_WSOP_TEXT) {
+    p[plen] = '\0';
+    msg1 = p[0] == '{' || p[0] == '[' ?
+             htsmsg_json_deserialize((char *)p) : NULL;
+    if (msg1) {
+      htsmsg_add_msg(msg, "json", msg1);
+      free(p);
+    } else {
+      htsmsg_add_str_alloc(msg, "text", (char *)p);
+    }
+  } else {
+    htsmsg_add_bin_alloc(msg, "bin", p, plen);
+  }
+  *_res = msg;
+  return 0;
+err1:
+  free(p);
+  return -1;
+}
 
 /**
  * Parse arguments of a HTTP GET url, not perfect, but works for us
@@ -1463,11 +1916,14 @@ http_serve_requests(http_connection_t *hc)
   char *argv[3], *c, *s, *cmdline = NULL, *hdrline = NULL;
   int n, r, delim;
 
-  pthread_mutex_init(&hc->hc_fd_lock, NULL);
+  tvh_mutex_init(&hc->hc_extra_lock, NULL);
   http_arg_init(&hc->hc_args);
   http_arg_init(&hc->hc_req_args);
   htsbuf_queue_init(&spill, 0);
   htsbuf_queue_init(&hc->hc_reply, 0);
+  htsbuf_queue_init(&hc->hc_extra, 0);
+  atomic_set(&hc->hc_extra_insend, 0);
+  atomic_set(&hc->hc_extra_chunks, 0);
 
   do {
     hc->hc_no_output  = 0;
@@ -1481,7 +1937,7 @@ http_serve_requests(http_connection_t *hc)
      * Format: 'PROXY TCP4 192.168.0.1 192.168.0.11 56324 9981\r\n'
      *                     SRC-ADDRESS DST-ADDRESS  SPORT DPORT */
     if (config.proxy && strncmp(cmdline, "PROXY ", 6) == 0) {
-      tvhtrace(LS_HTTP, "[PROXY] PROXY protocol detected! cmdline='%s'", cmdline);
+      tvhtrace(hc->hc_subsys, "[PROXY] PROXY protocol detected! cmdline='%s'", cmdline);
 
       argv[0] = cmdline;
       s = cmdline + 6;
@@ -1509,16 +1965,17 @@ http_serve_requests(http_connection_t *hc)
           goto error;  /* Not valid IP address */
         }
       }
+      if (*c != ' ') goto error;
       /* Check length */
-      if ((s-c) < 8) goto error;
-      if ((s-c) > (delim == ':' ? 39 : 16)) goto error;
+      if ((c-s) < 7) goto error;
+      if ((c-s) > (delim == ':' ? 45 : 15)) goto error;
       
       /* Add null terminator */
-      *(c-1) = '\0';
+      *c = '\0';
 
       /* Don't care about DST-ADDRESS, SRC-PORT & DST-PORT
          All it's OK, push the original client IP */
-      tvhtrace(LS_HTTP, "[PROXY] Original source='%s'", s);
+      tvhtrace(hc->hc_subsys, "[PROXY] Original source='%s'", s);
       http_arg_set(&hc->hc_args, "X-Forwarded-For", s);
       free(argv[0]);
     }
@@ -1577,10 +2034,13 @@ error:
   free(hdrline);
   free(cmdline);
   htsbuf_queue_flush(&spill);
+  htsbuf_queue_flush(&hc->hc_extra);
 
   free(hc->hc_nonce);
   hc->hc_nonce = NULL;
 
+  free(hc->hc_proxy_ip);
+  free(hc->hc_local_ip);
 }
 
 
@@ -1594,10 +2054,11 @@ http_serve(int fd, void **opaque, struct sockaddr_storage *peer,
   http_connection_t hc;
 
   /* Note: global_lock held on entry */
-  pthread_mutex_unlock(&global_lock);
+  tvh_mutex_unlock(&global_lock);
   memset(&hc, 0, sizeof(http_connection_t));
   *opaque = &hc;
 
+  hc.hc_subsys  = LS_HTTP;
   hc.hc_fd      = fd;
   hc.hc_peer    = peer;
   hc.hc_self    = self;
@@ -1610,7 +2071,7 @@ http_serve(int fd, void **opaque, struct sockaddr_storage *peer,
   close(fd);
 
   // Note: leave global_lock held for parent
-  pthread_mutex_lock(&global_lock);
+  tvh_mutex_lock(&global_lock);
   *opaque = NULL;
 }
 
@@ -1637,8 +2098,10 @@ http_server_init(const char *bindaddr)
     .cancel = http_cancel
   };
   RB_INIT(&http_nonces);
-  http_server = tcp_server_create(LS_HTTP, "HTTP", bindaddr, tvheadend_webui_port, &ops, NULL);
-  atomic_set(&http_server_running, 1);
+  if (tvheadend_webui_port > 0) {
+    http_server = tcp_server_create(LS_HTTP, "HTTP", bindaddr, tvheadend_webui_port, &ops, NULL);
+    atomic_set(&http_server_running, 1);
+  }
 }
 
 void
@@ -1653,22 +2116,22 @@ http_server_done(void)
   http_path_t *hp;
   http_nonce_t *n;
 
-  pthread_mutex_lock(&global_lock);
+  tvh_mutex_lock(&global_lock);
   atomic_set(&http_server_running, 0);
   if (http_server)
     tcp_server_delete(http_server);
   http_server = NULL;
-  pthread_mutex_lock(&http_paths_mutex);
+  tvh_mutex_lock(&http_paths_mutex);
   while ((hp = LIST_FIRST(&http_paths)) != NULL) {
     LIST_REMOVE(hp, hp_link);
     free((void *)hp->hp_path);
     free(hp);
   }
-  pthread_mutex_unlock(&http_paths_mutex);
+  tvh_mutex_unlock(&http_paths_mutex);
   while ((n = RB_FIRST(&http_nonces)) != NULL) {
     mtimer_disarm(&n->expire);
     RB_REMOVE(&http_nonces, n, link);
     free(n);
   }
-  pthread_mutex_unlock(&global_lock);
+  tvh_mutex_unlock(&global_lock);
 }

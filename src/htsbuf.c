@@ -67,6 +67,7 @@ htsbuf_queue_free(htsbuf_queue_t *hq)
 void
 htsbuf_data_free(htsbuf_queue_t *hq, htsbuf_data_t *hd)
 {
+  hq->hq_size -= hd->hd_data_size - hd->hd_data_off;
   TAILQ_REMOVE(&hq->hq_q, hd, hd_link);
   free(hd->hd_data);
   free(hd);
@@ -405,19 +406,30 @@ htsbuf_append_and_escape_url(htsbuf_queue_t *hq, const char *s)
     char buf[4];
     C = *c++;
     
+    /* RFC 3986, section 3.4 */
     if((C >= '0' && C <= '9') ||
        (C >= 'a' && C <= 'z') ||
        (C >= 'A' && C <= 'Z') ||
-       C == '_' ||
-       C == '~' ||
-       C == '.' ||
-       C == '-') {
+       C == '/'  ||
+       C == ':'  ||
+       C == '@'  ||
+       C == '-'  ||
+       C == '.'  ||
+       C == '~'  ||
+       C == '!'  ||
+       C == '$'  ||
+       C == '\'' ||
+       C == '('  ||
+       C == ')'  ||
+       C == '*'  ||
+       C == ','  ||
+       C == ';') {
       esc = NULL;
     } else {
       static const char hexchars[16] = "0123456789ABCDEF";
       buf[0] = '%';
       buf[1] = hexchars[(C >> 4) & 0xf];
-      buf[2] = hexchars[C & 0xf];;
+      buf[2] = hexchars[C & 0xf];
       buf[3] = 0;
       esc = buf;
     }
@@ -435,6 +447,61 @@ htsbuf_append_and_escape_url(htsbuf_queue_t *hq, const char *s)
   }
 }
 
+/**
+ * RFC8187 (RFC5987) HTTP Header non-ASCII field encoding
+ */
+void
+htsbuf_append_and_escape_rfc8187(htsbuf_queue_t *hq, const char *s)
+{
+  const char *c = s;
+  const char *e = s + strlen(s);
+  char C;
+  if(e == s)
+    return;
+
+  while(1) {
+    const char *esc;
+    char buf[4];
+    C = *c++;
+
+    /* RFC 8187, section 3.2.1, attr-char */
+    if((C >= '0' && C <= '9') ||
+       (C >= 'a' && C <= 'z') ||
+       (C >= 'A' && C <= 'Z') ||
+       C == '!'  ||
+       C == '#'  ||
+       C == '$'  ||
+       C == '&'  ||
+       C == '+'  ||
+       C == '-'  ||
+       C == '.'  ||
+       C == '^'  ||
+       C == '_'  ||
+       C == '`'  ||
+       C == '|'  ||
+       C == '~') {
+      esc = NULL;
+    } else {
+      static const char hexchars[16] = "0123456789ABCDEF";
+      buf[0] = '%';
+      buf[1] = hexchars[(C >> 4) & 0xf];
+      buf[2] = hexchars[C & 0xf];
+      buf[3] = 0;
+      esc = buf;
+    }
+
+    if(esc != NULL) {
+      htsbuf_append(hq, s, c - s - 1);
+      htsbuf_append_str(hq, esc);
+      s = c;
+    }
+
+    if(c == e) {
+      htsbuf_append(hq, s, c - s);
+      break;
+    }
+  }
+}
 
 /**
  *

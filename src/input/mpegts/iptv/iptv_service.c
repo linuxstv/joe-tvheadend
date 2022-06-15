@@ -19,14 +19,19 @@
 
 #include "iptv_private.h"
 #include "settings.h"
+#include "config.h"
 
 extern const idclass_t mpegts_service_class;
 
 static htsmsg_t *
 iptv_service_config_save ( service_t *s, char *filename, size_t fsize )
 {
-  mpegts_mux_t *mm = ((mpegts_service_t *)s)->s_dvb_mux;
-  idnode_changed(&mm->mm_id);
+  if (filename == NULL) {
+    htsmsg_t *e = htsmsg_create_map();
+    service_save(s, e);
+    return e;
+  }
+  idnode_changed(&((mpegts_service_t *)s)->s_dvb_mux->mm_id);
   return NULL;
 }
 
@@ -66,15 +71,26 @@ iptv_service_channel_icon ( service_t *s )
   iptv_mux_t       *im = (iptv_mux_t *)is->s_dvb_mux;
   iptv_network_t   *in = (iptv_network_t *)im->mm_network;
   const char       *ic = im->mm_iptv_icon;
+  const char       *dir = NULL;
   if (ic && ic[0]) {
     if (strncmp(ic, "http://", 7) == 0 ||
-        strncmp(ic, "https://", 8) == 0)
+        strncmp(ic, "https://", 8) == 0 ||
+        strncmp(ic, "file:///", 8) == 0)
       return ic;
-    if (strncmp(ic, "file:///", 8) == 0)
-      return ic + 7;
-    if (strncmp(ic, "file://", 7) == 0)
+    if (strncmp(ic, "file://", 7) == 0) {
+      const char *chicon = config.chicon_path;
       ic += 7;
-    if (in && in->in_icon_url && in->in_icon_url[0]) {
+      if (chicon && chicon[0] >= ' ' && chicon[0] <= 122) {
+        dir = chicon;
+      } else {
+        dir = "file:///";
+      }
+    } else {
+      if (in && in->in_icon_url && in->in_icon_url[0])
+        dir = in->in_icon_url;
+    }
+    if (dir && ic) {
+      while (ic[0] == '/') ic++;
       snprintf(prop_sbuf, PROP_SBUF_LEN, "%s/%s", in->in_icon_url, ic);
       return prop_sbuf;
     }
@@ -119,7 +135,6 @@ iptv_service_create0
   ( iptv_mux_t *im, uint16_t sid, uint16_t pmt,
     const char *uuid, htsmsg_t *conf )
 {
-  iptv_network_t *in = (iptv_network_t *)im->mm_network;
   iptv_service_t *is = (iptv_service_t*)
     mpegts_service_create0(calloc(1, sizeof(mpegts_service_t)),
                            &mpegts_service_class, uuid,
@@ -137,9 +152,6 @@ iptv_service_create0
   if (!is->s_dvb_svcname || !*is->s_dvb_svcname)
     if (im->mm_iptv_svcname)
       is->s_dvb_svcname = strdup(im->mm_iptv_svcname);
-
-  if (in->in_bouquet)
-    iptv_bouquet_trigger(in, 1);
 
   return is;
 }

@@ -21,17 +21,18 @@
 
 #include "idnode.h"
 
-#include <pthread.h>
-
 /* **************************************************************************
  * Typedefs/Forward decls
  * *************************************************************************/
 
+typedef struct epggrab_queued_data  epggrab_queued_data_t;
 typedef struct epggrab_module       epggrab_module_t;
 typedef struct epggrab_module_int   epggrab_module_int_t;
 typedef struct epggrab_module_ext   epggrab_module_ext_t;
 typedef struct epggrab_module_ota   epggrab_module_ota_t;
+typedef struct epggrab_module_ota_scraper   epggrab_module_ota_scraper_t;
 typedef struct epggrab_ota_mux      epggrab_ota_mux_t;
+typedef struct epggrab_ota_mux_eit_plist    epggrab_ota_mux_eit_plist_t;
 typedef struct epggrab_ota_map      epggrab_ota_map_t;
 typedef struct epggrab_ota_svc_link epggrab_ota_svc_link_t;
 
@@ -139,12 +140,23 @@ int epggrab_channel_is_ota ( epggrab_channel_t *ec );
  * *************************************************************************/
 
 /*
+ * Data queue
+ */
+struct epggrab_queued_data
+{
+  TAILQ_ENTRY(epggrab_queued_data) eq_link;
+  uint32_t                         eq_len;
+  uint8_t                          eq_data[0]; ///< Data are allocated at the end of structure
+};
+
+/*
  * Grabber base class
  */
 struct epggrab_module
 {
   idnode_t                     idnode;
   LIST_ENTRY(epggrab_module)   link;      ///< Global list link
+  TAILQ_ENTRY(epggrab_module)  qlink;     ///< Queued data link
 
   enum {
     EPGGRAB_OTA,
@@ -160,11 +172,16 @@ struct epggrab_module
   int                          priority;  ///< Priority of the module
   epggrab_channel_tree_t       channels;  ///< Channel list
 
+  TAILQ_HEAD(, epggrab_queued_data) data_queue;
+
   /* Activate */
-  int       (*activate) ( void *m, int activate );
+  int       (*activate)( void *m, int activate );
 
   /* Free */
-  void      (*done)    ( void *m );
+  void      (*done)( void *m );
+
+  /* Process queued data */
+  void      (*process_data)( void *m, void *data, uint32_t len );
 };
 
 /*
@@ -178,6 +195,10 @@ struct epggrab_module_int
   const char                   *args;     ///< Extra arguments
 
   int                           xmltv_chnum;
+  int                           xmltv_scrape_extra; ///< Scrape actors and extra details
+  int                           xmltv_scrape_onto_desc; ///< Include scraped actors
+    ///< and extra details on to programme description for viewing by legacy clients.
+  int                           xmltv_use_category_not_genre; ///< Use category tags and don't map to DVB genres.
 
   /* Handle data */
   char*     (*grab)   ( void *mod );
@@ -199,9 +220,15 @@ struct epggrab_module_ext
 
 struct epggrab_ota_svc_link
 {
-  char                          *uuid;
+  tvh_uuid_t                     uuid;
   uint64_t                       last_tune_count;
   RB_ENTRY(epggrab_ota_svc_link) link;
+};
+
+struct epggrab_ota_mux_eit_plist {
+  LIST_ENTRY(epggrab_ota_mux_eit_plist) link;
+  const char *src;
+  void *priv;
 };
 
 /*
@@ -210,15 +237,18 @@ struct epggrab_ota_svc_link
  */
 struct epggrab_ota_mux
 {
-  char                              *om_mux_uuid;     ///< Soft-link to mux
+  tvh_uuid_t                         om_mux_uuid;     ///< Soft-link to mux
   LIST_HEAD(,epggrab_ota_map)        om_modules;      ///< List of linked mods
   
   uint8_t                            om_done;         ///< The full completion mark for this round
   uint8_t                            om_complete;     ///< Has completed a scan
   uint8_t                            om_requeue;      ///< Requeue when stolen
   uint8_t                            om_save;         ///< something changed
+  uint8_t                            om_detected;     ///< detected some activity
   mtimer_t                           om_timer;        ///< Per mux active timer
   mtimer_t                           om_data_timer;   ///< Any EPG data seen?
+  mtimer_t                           om_handlers_timer; ///< Run handlers callback
+  int64_t                            om_retry_time;   ///< Next time to retry
 
   char                              *om_force_modname;///< Force this module
 
@@ -230,6 +260,8 @@ struct epggrab_ota_mux
 
   TAILQ_ENTRY(epggrab_ota_mux)       om_q_link;
   RB_ENTRY(epggrab_ota_mux)          om_global_link;
+
+  LIST_HEAD(, epggrab_ota_mux_eit_plist) om_eit_plist;
 };
 
 /*
@@ -241,9 +273,9 @@ struct epggrab_ota_map
   epggrab_module_ota_t               *om_module;
   int                                 om_complete;
   uint8_t                             om_first;
-  uint8_t                             om_forced;
   uint64_t                            om_tune_count;
-  RB_HEAD(,epggrab_ota_svc_link)      om_svcs;         ///< Muxes we carry data for
+  RB_HEAD(,epggrab_ota_svc_link)      om_svcs;         ///< Services we carry data for
+  void                               *om_opaque;
 };
 
 /*
@@ -255,9 +287,24 @@ struct epggrab_module_ota
 
   /* Transponder tuning */
   int  (*start) ( epggrab_ota_map_t *map, struct mpegts_mux *mm );
+  int  (*stop)  ( epggrab_ota_map_t *map, struct mpegts_mux *mm );
+  void (*handlers) (epggrab_ota_map_t *map, struct mpegts_mux *mm );
   int  (*tune)  ( epggrab_ota_map_t *map, epggrab_ota_mux_t *om,
                   struct mpegts_mux *mm );
   void  *opaque;
+};
+
+/*
+ * Over the air grabber that supports configurable scraping of data.
+ */
+struct epggrab_module_ota_scraper
+{
+  epggrab_module_ota_t             ;      ///< Parent object
+  char                   *scrape_config;  ///< Config to use or blank/NULL for default.
+  int                     scrape_episode; ///< Scrape season/episode from EIT summary
+  int                     scrape_title;   ///< Scrape title from EIT title + summary
+  int                     scrape_subtitle;///< Scrape subtitle from EIT summary
+  int                     scrape_summary; ///< Scrape summary from EIT summary
 };
 
 /*
@@ -270,9 +317,11 @@ typedef struct epggrab_conf {
   uint32_t              channel_renumber;
   uint32_t              channel_reicon;
   uint32_t              epgdb_periodicsave;
+  uint32_t              epgdb_saveafterimport;
   char                 *ota_cron;
   uint32_t              ota_timeout;
   uint32_t              ota_initial;
+  uint32_t              int_initial;
 } epggrab_conf_t;
 
 /*
@@ -294,6 +343,13 @@ epggrab_module_t* epggrab_module_find_by_id ( const char *id );
 const char * epggrab_module_type(epggrab_module_t *mod);
 const char * epggrab_module_get_status(epggrab_module_t *mod);
 
+/*
+ * Data queue
+ */
+void epggrab_queue_data(epggrab_module_t *mod,
+                        const void *data1, uint32_t len1,
+                        const void *data2, uint32_t len2);
+
 /* **************************************************************************
  * Setup/Configuration
  * *************************************************************************/
@@ -302,7 +358,7 @@ const char * epggrab_module_get_status(epggrab_module_t *mod);
  * Configuration
  */
 extern epggrab_module_list_t epggrab_modules;
-extern pthread_mutex_t       epggrab_mutex;
+extern tvh_mutex_t           epggrab_mutex;
 extern int                   epggrab_running;
 extern int                   epggrab_ota_running;
 
@@ -335,14 +391,12 @@ void epggrab_channel_rem ( struct channel *ch );
 void epggrab_channel_mod ( struct channel *ch );
 
 /*
- * Re-schedule
- */
-void epggrab_resched     ( void );
-
-/*
  * OTA kick
  */
 void epggrab_ota_queue_mux( struct mpegts_mux *mm );
+epggrab_ota_mux_t *epggrab_ota_find_mux ( struct mpegts_mux *mm );
+htsmsg_t *epggrab_ota_module_id_list( const char *lang );
+const char *epggrab_ota_check_module_id( const char *id );
 
 #endif /* __EPGGRAB_H__ */
 

@@ -53,7 +53,7 @@ fsmonitor_thread ( void* p )
   fsmonitor_link_t *fml;
   fsmonitor_t *fsm;
 
-  while (atomic_get(&tvheadend_running)) {
+  while (tvheadend_is_running()) {
 
     fd = atomic_get(&fsmonitor_fd);
     if (fd < 0)
@@ -65,7 +65,7 @@ fsmonitor_thread ( void* p )
       break;
 
     /* Process */
-    pthread_mutex_lock(&global_lock);
+    tvh_mutex_lock(&global_lock);
     i = 0;
     while ( i < c ) {
       ev = (struct inotify_event*)&buf[i];
@@ -95,7 +95,7 @@ fsmonitor_thread ( void* p )
           fsm->fsm_delete(fsm, path);
       }
     }
-    pthread_mutex_unlock(&global_lock);
+    tvh_mutex_unlock(&global_lock);
   }
   return NULL;
 }
@@ -110,7 +110,7 @@ fsmonitor_init ( void )
 {
   /* Intialise inotify */
   atomic_set(&fsmonitor_fd, inotify_init1(IN_CLOEXEC));
-  tvhthread_create(&fsmonitor_tid, NULL, fsmonitor_thread, NULL, "fsmonitor");
+  tvh_thread_create(&fsmonitor_tid, NULL, fsmonitor_thread, NULL, "fsmonitor");
 }
 
 /*
@@ -120,8 +120,8 @@ void
 fsmonitor_done ( void )
 {
   int fd = atomic_exchange(&fsmonitor_fd, -1);
-  if (fd >= 0) close(fd);
-  pthread_kill(fsmonitor_tid, SIGTERM);
+  if (fd >= 0) blacklisted_close(fd);
+  tvh_thread_kill(fsmonitor_tid, SIGTERM);
   pthread_join(fsmonitor_tid, NULL);
 }
 

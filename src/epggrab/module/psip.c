@@ -284,7 +284,7 @@ psip_complete_table(psip_status_t *ps, mpegts_table_t *mt)
  * Description routines
  * ***********************************************************************/
 
-/* Compare language codes */
+/* Compare eventid codes */
 static int _desc_cmp ( void *a, void *b )
 {
   return (int)(((psip_desc_t*)a)->pd_eventid) -
@@ -340,14 +340,13 @@ _psip_eit_callback_channel
   uint16_t eventid;
   uint32_t starttime, length;
   time_t start, stop;
-  int save = 0, save2, save3, i, size;
+  int save = 0, save2, i, size;
   uint8_t titlelen;
   unsigned int dlen;
   epg_broadcast_t *ebc;
-  epg_episode_t *ee;
   lang_str_t *title, *description;
   psip_desc_t *pd;
-  uint32_t changes2, changes3;
+  epg_changes_t changes2;
   epggrab_module_t *mod = (epggrab_module_t *)ps->ps_mod;
 
   for (i = 0; len >= 12 && i < count; len -= size, ptr += size, i++) {
@@ -377,14 +376,17 @@ _psip_eit_callback_channel
 
     if (size > len) break;
 
+    if (epg_channel_ignore_broadcast(ch, start)) continue;
+
     title = atsc_get_string(ptr+10, titlelen);
     if (title == NULL) continue;
 
     tvhtrace(LS_PSIP, "  %03d: [%s] eventid 0x%04x at %"PRItime_t", duration %d, title: '%s' (%d bytes)",
-             i, ch ? channel_get_name(ch) : "(null)", eventid, start, length,
+             i, ch ? channel_get_name(ch, channel_blank_name) : "(null)",
+             eventid, start, length,
              lang_str_get(title, NULL), titlelen);
 
-    save2 = save3 = changes2 = changes3 = 0;
+    save2 = changes2 = 0;
 
     ebc = epg_broadcast_find_by_time(ch, mod, start, stop, 1, &save2, &changes2);
     tvhtrace(LS_PSIP, "  eid=%5d, start=%"PRItime_t", stop=%"PRItime_t", ebc=%p",
@@ -402,16 +404,11 @@ _psip_eit_callback_channel
       }
     }
 
-    ee = epg_episode_find_by_broadcast(ebc, mod, 1, &save3, &changes3);
-    if (ee) {
-      save2 |= epg_broadcast_set_episode(ebc, ee, &changes2);
-      save3 |= epg_episode_set_title(ee, title, &changes3);
-      save3 |= epg_episode_change_finish(ee, changes3, 0);
-    }
+    save |= epg_broadcast_set_title(ebc, title, &changes2);
 
     save |= epg_broadcast_change_finish(ebc, changes2, 0);
 
-    save |= save2 | save3;
+    save |= save2;
 
 next:
     lang_str_destroy(title);
@@ -457,7 +454,6 @@ _psip_eit_callback
   mpegts_psi_table_state_t *st;
   idnode_list_mapping_t *ilm;
   th_subscription_t    *ths;
-  char ubuf[UUID_HEX_SIZE];
 
   /* Validate */
   if (tableid != 0xcb) return -1;
@@ -489,7 +485,7 @@ _psip_eit_callback
 
   /* Begin */
   r = dvb_table_begin((mpegts_psi_table_t *)mt, ptr, len, tableid, extraid, 7,
-                      &st, &sect, &last, &ver);
+                      &st, &sect, &last, &ver, 0);
   if (r == 0) goto complete;
   if (r != 1) return r;
   tvhtrace(LS_PSIP, "0x%04x: EIT tsid %04X (%s), ver %d",
@@ -506,8 +502,7 @@ _psip_eit_callback
 
   /* Register this */
   if (ps->ps_ota)
-    epggrab_ota_service_add(map, ps->ps_ota,
-                            idnode_uuid_as_str(&svc->s_id, ubuf), 1);
+    epggrab_ota_service_add(map, ps->ps_ota, &svc->s_id.in_uuid, 1);
 
   /* For each associated channels */
   LIST_FOREACH(ilm, &svc->s_channels, ilm_in1_link) {
@@ -549,7 +544,7 @@ _psip_ett_callback
   lang_str_t *description;
   idnode_list_mapping_t *ilm;
   channel_t            *ch;
-  uint32_t              changes;
+  epg_changes_t         changes;
 
   /* Validate */
   if (tableid != 0xcc) return -1;
@@ -567,7 +562,7 @@ _psip_ett_callback
 
   /* Begin */
   r = dvb_table_begin((mpegts_psi_table_t *)mt, ptr, len, tableid, extraid, 7,
-                      &st, &sect, &last, &ver);
+                      &st, &sect, &last, &ver, 0);
   if (r == 0) goto complete;
   if (r != 1) return r;
 
@@ -604,7 +599,7 @@ _psip_ett_callback
         save |= epg_broadcast_change_finish(ebc, changes, 1);
         tvhtrace(LS_PSIP, "0x%04x: ETT tableid 0x%04X [%s], eventid 0x%04X (%d) ['%s'], ver %d",
                  mt->mt_pid, tsid, svc->s_dvb_svcname, eventid, eventid,
-                 lang_str_get(ebc->episode->title, "eng"), ver);
+                 lang_str_get(ebc->title, "eng"), ver);
       } else {
         found = 0;
       }
@@ -659,7 +654,7 @@ _psip_mgt_callback
 
   /* Begin */
   r = dvb_table_begin((mpegts_psi_table_t *)mt, ptr, len, tableid, extraid, 7,
-                      &st, &sect, &last, &ver);
+                      &st, &sect, &last, &ver, 0);
   if (r != 1) return r;
 
   /* # tables */
@@ -702,12 +697,8 @@ _psip_mgt_callback
 static int _psip_start
   ( epggrab_ota_map_t *map, mpegts_mux_t *dm )
 {
-  epggrab_module_ota_t *m = map->om_module;
   mpegts_table_t *mt;
   psip_status_t *ps;
-
-  /* Disabled */
-  if (!m->enabled && !map->om_forced) return -1;
 
   ps = calloc(1, sizeof(*ps));
   TAILQ_INIT(&ps->ps_tables);
@@ -735,14 +726,10 @@ static int _psip_tune
   ( epggrab_ota_map_t *map, epggrab_ota_mux_t *om, mpegts_mux_t *mm )
 {
   int r = 0;
-  epggrab_module_ota_t *m = map->om_module;
   mpegts_service_t *s;
   epggrab_ota_svc_link_t *osl, *nxt;
 
   lock_assert(&global_lock);
-
-  /* Disabled */
-  if (!m->enabled) return 0;
 
   /* Have gathered enough info to decide */
   if (!om->om_complete)
@@ -756,7 +743,7 @@ static int _psip_tune
     nxt = RB_NEXT(osl, link);
     /* rule: if 5 mux scans fail for this service, remove it */
     if (osl->last_tune_count + 5 <= map->om_tune_count ||
-        !(s = mpegts_service_find_by_uuid(osl->uuid))) {
+        !(s = mpegts_service_find_by_uuid0(&osl->uuid))) {
       epggrab_ota_service_del(map, om, osl, 1);
     } else {
       if (LIST_FIRST(&s->s_channels))
@@ -767,6 +754,21 @@ static int _psip_tune
   return r;
 }
 
+htsmsg_t *psip_module_id_list( const char *lang )
+{
+  htsmsg_t *e, *l = htsmsg_create_list();
+  e = htsmsg_create_key_val("psip", "PSIP: ATSC Grabber");
+  htsmsg_add_msg(l, NULL, e);
+  return l;
+}
+
+const char *psip_check_module_id ( const char *id )
+{
+  if (id && strcmp(id, "psip") == 0)
+    return "psip";
+  return NULL;
+}
+
 void psip_init ( void )
 {
   static epggrab_ota_module_ops_t ops = {
@@ -774,7 +776,8 @@ void psip_init ( void )
     .tune  = _psip_tune,
   };
 
-  epggrab_module_ota_create(NULL, "psip", LS_PSIP, NULL, "PSIP: ATSC Grabber", 1, &ops);
+  epggrab_module_ota_create(NULL, "psip", LS_PSIP, NULL, "PSIP: ATSC Grabber",
+                            1, NULL, &ops);
 }
 
 void psip_done ( void )

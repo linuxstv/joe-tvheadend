@@ -16,17 +16,7 @@
  *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <pthread.h>
-#include <assert.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/ioctl.h>
-#include <fcntl.h>
 #include <ctype.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <string.h>
 
 #include "settings.h"
 #include "config.h"
@@ -46,12 +36,15 @@
 #include "intlconv.h"
 #include "memoryinfo.h"
 
-#define CHANNEL_BLANK_NAME  "{name-not-set}"
+typedef int (sortfcn_t)(const void *, const void *);
 
 struct channel_tree channels;
+int channels_count;
 
 struct channel_tag_queue channel_tags;
+int channel_tags_count;
 
+const char *channel_blank_name = N_("{name-not-set}");
 static int channel_in_load;
 
 static void channel_tag_init ( void );
@@ -65,6 +58,18 @@ ch_id_cmp ( channel_t *a, channel_t *b )
   return channel_get_id(a) - channel_get_id(b);
 }
 
+static void
+channel_load_icon ( channel_t *ch )
+{
+  (void)imagecache_get_id(channel_get_icon(ch));
+}
+
+static void
+channel_tag_load_icon ( channel_tag_t *tag )
+{
+  (void)imagecache_get_id(channel_tag_get_icon(tag));
+}
+
 /* **************************************************************************
  * Class definition
  * *************************************************************************/
@@ -74,7 +79,10 @@ channel_class_changed ( idnode_t *self )
 {
   channel_t *ch = (channel_t *)self;
 
-  tvhdebug(LS_CHANNEL, "channel '%s' changed", channel_get_name(ch));
+  if (atomic_add(&ch->ch_changed_ref, 1) > 0)
+    goto end;
+
+  tvhdebug(LS_CHANNEL, "channel '%s' changed", channel_get_name(ch, channel_blank_name));
 
   /* update the EPG channel <-> channel mapping here */
   if (ch->ch_enabled && ch->ch_epgauto)
@@ -82,6 +90,9 @@ channel_class_changed ( idnode_t *self )
 
   /* HTSP */
   htsp_channel_update(ch);
+
+end:
+  atomic_dec(&ch->ch_changed_ref, 0);
 }
 
 static htsmsg_t *
@@ -92,10 +103,11 @@ channel_class_save ( idnode_t *self, char *filename, size_t fsize )
   char ubuf[UUID_HEX_SIZE];
   /* save channel (on demand) */
   if (ch->ch_dont_save == 0) {
-    tvhdebug(LS_CHANNEL, "channel '%s' save", channel_get_name(ch));
+    tvhdebug(LS_CHANNEL, "channel '%s' save", channel_get_name(ch, channel_blank_name));
     c = htsmsg_create_map();
     idnode_save(&ch->ch_id, c);
-    snprintf(filename, fsize, "channel/config/%s", idnode_uuid_as_str(&ch->ch_id, ubuf));
+    if (filename)
+      snprintf(filename, fsize, "channel/config/%s", idnode_uuid_as_str(&ch->ch_id, ubuf));
   }
   return c;
 }
@@ -106,6 +118,14 @@ channel_class_delete ( idnode_t *self )
   channel_delete((channel_t*)self, 1);
 }
 
+static void
+channel_class_notify_enabled ( void *obj, const char *lang )
+{
+  channel_t *ch = (channel_t *)obj;
+  if (!ch->ch_enabled)
+    channel_remove_subscriber(ch, SM_CODE_CHN_NOT_ENABLED);
+}
+
 static int
 channel_class_autoname_set ( void *obj, const void *p )
 {
@@ -113,10 +133,14 @@ channel_class_autoname_set ( void *obj, const void *p )
   const char *s;
   int b = *(int *)p;
   if (ch->ch_autoname != b) {
-    if (b == 0 && (!ch->ch_name || *ch->ch_name == '\0')) {
-      s = channel_get_name(ch);
-      free(ch->ch_name);
-      ch->ch_name = strdup(s);
+    if (b == 0 && tvh_str_default(ch->ch_name, NULL) == NULL) {
+      s = channel_get_name(ch, NULL);
+      if (s) {
+        free(ch->ch_name);
+        ch->ch_name = strdup(s);
+      } else {
+        return 0;
+      }
     } else if (b) {
       if (ch->ch_name)
         ch->ch_name[0] = '\0';
@@ -197,21 +221,25 @@ channel_class_icon_notify ( void *obj, const char *lang )
 {
   channel_t *ch = obj;
   if (!ch->ch_load)
-    (void)channel_get_icon(obj);
+    channel_load_icon(obj);
 }
 
-static const void *
+const void *
 channel_class_get_icon ( void *obj )
 {
-  static const char *s;
-  s = channel_get_icon(obj);
-  return &s;
+  prop_ptr = channel_get_icon(obj);
+  if (!strempty(prop_ptr))
+    prop_ptr = imagecache_get_propstr(prop_ptr, prop_sbuf, PROP_SBUF_LEN);
+  return &prop_ptr;
 }
 
-static const char *
-channel_class_get_title ( idnode_t *self, const char *lang )
+static void
+channel_class_get_title
+  ( idnode_t *self, const char *lang, char *dst, size_t dstsize )
 {
-  return channel_get_name((channel_t*)self);
+  const char *s = channel_get_name((channel_t*)self,
+                                   tvh_gettext_lang(lang, channel_blank_name));
+  snprintf(dst, dstsize, "%s", s);
 }
 
 /* exported for others */
@@ -224,6 +252,10 @@ channel_class_get_list(void *o, const char *lang)
   htsmsg_add_str(m, "uri",   "channel/list");
   htsmsg_add_str(m, "event", "channel");
   htsmsg_add_u32(p, "all",  1);
+  if (config.chname_num)
+    htsmsg_add_u32(p, "numbers", 1);
+  if (config.chname_src)
+    htsmsg_add_u32(p, "sources", 1);
   htsmsg_add_msg(m, "params", p);
   return m;
 }
@@ -246,9 +278,8 @@ channel_class_set_name ( void *o, const void *p )
 static const void *
 channel_class_get_name ( void *o )
 {
-  static const char *s;
-  s = channel_get_name(o);
-  return &s;
+  prop_ptr = channel_get_name(o, channel_blank_name);
+  return &prop_ptr;
 }
 
 static const void *
@@ -369,7 +400,7 @@ PROP_DOC(runningstate)
 
 const idclass_t channel_class = {
   .ic_class      = "channel",
-  .ic_caption    = N_("Channels"),
+  .ic_caption    = N_("Channels / EPG - Channels"),
   .ic_doc        = tvh_doc_channel_class,
   .ic_event      = "channel",
   .ic_changed    = channel_class_changed,
@@ -384,6 +415,7 @@ const idclass_t channel_class = {
       .desc     = N_("Enable/disable the channel."),
       .def.i    = 1,
       .off      = offsetof(channel_t, ch_enabled),
+      .notify   = channel_class_notify_enabled,
     },
     {
       .type     = PT_BOOL,
@@ -422,8 +454,8 @@ const idclass_t channel_class = {
       .type     = PT_STR,
       .id       = "icon",
       .name     = N_("User icon"),
-      .desc     = N_("The URL (or path) to the icon to use/used "
-                     "for the channel."),
+      .desc     = N_("The URL to the icon to use/used for the channel. "
+                     "The local files are referred using file:/// URLs."),
       .off      = offsetof(channel_t, ch_icon),
       .notify   = channel_class_icon_notify,
       .opts     = PO_ADVANCED,
@@ -448,6 +480,17 @@ const idclass_t channel_class = {
                      "specifically set a different EPG Source."),
       .def.i    = 1,
       .off      = offsetof(channel_t, ch_epgauto),
+      .opts     = PO_ADVANCED,
+    },
+    {
+      .type     = PT_U32,
+      .id       = "epglimit",
+      .name     = N_("Limit EPG (days)"),
+      .desc     = N_("Limit EPG data to specified days to reduce "
+                     "the memory consumption. The zero value means "
+                     "unlimited EPG."),
+      .def.i    = 1,
+      .off      = offsetof(channel_t, ch_epg_limit),
       .opts     = PO_ADVANCED,
     },
     {
@@ -554,14 +597,94 @@ const idclass_t channel_class = {
 // Note: since channel names are no longer unique this method will simply
 //       return the first entry encountered, so could be somewhat random
 channel_t *
-channel_find_by_name ( const char *name )
+channel_find_by_name_and_bouquet ( const char *name, const struct bouquet *bq )
 {
   channel_t *ch;
+  const char *s;
+
   if (name == NULL)
     return NULL;
-  CHANNEL_FOREACH(ch)
-    if (ch->ch_enabled && !strcmp(channel_get_name(ch), name))
+  CHANNEL_FOREACH(ch) {
+    if (!ch->ch_enabled) continue;
+    s = channel_get_name(ch, NULL);
+    if (s == NULL) continue;
+    if (bq && ch->ch_bouquet != bq) continue;
+    if (strcmp(s, name) == 0) break;
+  }
+  return ch;
+}
+
+channel_t *
+channel_find_by_name(const char *name)
+{
+  return channel_find_by_name_and_bouquet(name, NULL);
+}
+
+/// Copy name without space and (U)HD suffix, lowercase in to a new
+/// buffer
+static char *
+channel_make_fuzzy_name(const char *name)
+{
+  if (!name) return NULL;
+  const size_t len = strlen(name);
+  char *fuzzy_name = malloc(len + 1);
+  char *ch_fuzzy = fuzzy_name;
+  const char *ch = name;
+
+  for (; *ch ; ++ch) {
+    /* Strip trailing 'HD'. */
+    if (*ch == 'H' && *(ch+1) == 'D' && *(ch+2) == 0)
       break;
+    /* Strip trailing 'UHD'. */
+    if (*ch == 'U' && *(ch+1) == 'H' && *(ch+2) == 'D' && *(ch+3) == 0)
+      break;
+    /* Strip trailing 'FHD'. */
+    if (*ch == 'F' && *(ch+1) == 'H' && *(ch+2) == 'D' && *(ch+3) == 0)
+      break;
+
+    if (!isspace(*ch)) {
+      *ch_fuzzy++ = tolower(*ch);
+    }
+  }
+  /* Terminate the string */
+  *ch_fuzzy = 0;
+  return fuzzy_name;
+}
+
+channel_t *
+channel_find_by_name_bouquet_fuzzy ( const char *name, const struct bouquet *bq )
+{
+  channel_t *ch;
+  const char *s;
+
+  if (name == NULL)
+    return NULL;
+
+  char *fuzzy_name = channel_make_fuzzy_name(name);
+
+  CHANNEL_FOREACH(ch) {
+    if (!ch->ch_enabled) continue;
+    if (bq && ch->ch_bouquet != bq) continue;
+    s = channel_get_name(ch, NULL);
+    if (s == NULL) continue;
+    /* We need case insensitive since historical constraints means we
+     * often have channels with slightly different case on DVB-T vs
+     * DVB-S such as 'One' and 'ONE'.
+     */
+    if (strcasecmp(s, name) == 0) break;
+    if (strcasecmp(s, fuzzy_name) == 0) break;
+
+    /* If here, we don't have an obvious match, so we need to fixup
+     * the ch name to see if it then matches. We can use strcmp
+     * since both names are already lowercased.
+     */
+    char *s_fuzzy_name = channel_make_fuzzy_name(s);
+    const int is_match = !strcmp(s_fuzzy_name, fuzzy_name);
+    free(s_fuzzy_name);
+    if (is_match) break;
+  }
+
+  free(fuzzy_name);
   return ch;
 }
 
@@ -603,13 +726,16 @@ int
 channel_access(channel_t *ch, access_t *a, int disabled)
 {
   char ubuf[UUID_HEX_SIZE];
+  idnode_list_mapping_t *ilm;
+  htsmsg_field_t *f;
 
   if (!a)
     return 0;
 
   if (!ch) {
     /* If user has full rights, allow access to removed chanels */
-    if (a->aa_chrange == NULL && a->aa_chtags == NULL)
+    if (a->aa_chrange == NULL && a->aa_chtags == NULL &&
+        a->aa_chtags_exclude == NULL)
       return 1;
     return 0;
   }
@@ -627,20 +753,21 @@ channel_access(channel_t *ch, access_t *a, int disabled)
   }
 
   /* Channel tag check */
-  if (a->aa_chtags) {
-    idnode_list_mapping_t *ilm;
-    htsmsg_field_t *f;
-    HTSMSG_FOREACH(f, a->aa_chtags) {
-      LIST_FOREACH(ilm, &ch->ch_ctms, ilm_in2_link) {
+  if (a->aa_chtags_exclude) {
+    HTSMSG_FOREACH(f, a->aa_chtags_exclude)
+      LIST_FOREACH(ilm, &ch->ch_ctms, ilm_in2_link)
         if (!strcmp(htsmsg_field_get_str(f) ?: "",
                     idnode_uuid_as_str(ilm->ilm_in1, ubuf)))
-          goto chtags_ok;
-      }
-    }
+          return 0;
+  }
+  if (a->aa_chtags) {
+    HTSMSG_FOREACH(f, a->aa_chtags)
+      LIST_FOREACH(ilm, &ch->ch_ctms, ilm_in2_link)
+        if (!strcmp(htsmsg_field_get_str(f) ?: "",
+                    idnode_uuid_as_str(ilm->ilm_in1, ubuf)))
+          return 1;
     return 0;
   }
-chtags_ok:
-
   return 1;
 }
 
@@ -669,14 +796,35 @@ channel_epg_update_all ( channel_t *ch )
    channel_event_updated(e);
 }
 
+/**
+ * Remove all subscribers for given channel
+ */
+void channel_remove_subscriber
+  ( channel_t *ch, int reason )
+{
+  th_subscription_t *s, *s_next;
+  idnode_list_mapping_t *ilm;
+  service_t *t;
+
+  lock_assert(&global_lock);
+
+  LIST_FOREACH(ilm, &ch->ch_services, ilm_in2_link) {
+    t = (service_t *)ilm->ilm_in1;
+    for (s = LIST_FIRST(&t->s_subscriptions); s; s = s_next) {
+      s_next = LIST_NEXT(s, ths_service_link);
+      if (s->ths_channel == ch)
+        service_remove_subscriber(t, s, reason);
+    }
+  }
+}
+
 /* **************************************************************************
  * Property updating
  * *************************************************************************/
 
 const char *
-channel_get_name ( channel_t *ch )
+channel_get_name ( channel_t *ch, const char *blank )
 {
-  static const char *blank = CHANNEL_BLANK_NAME;
   const char *s;
   idnode_list_mapping_t *ilm;
   if (ch->ch_name && *ch->ch_name) return ch->ch_name;
@@ -684,6 +832,39 @@ channel_get_name ( channel_t *ch )
     if ((s = service_get_channel_name((service_t *)ilm->ilm_in1)))
       return s;
   return blank;
+}
+
+char *
+channel_get_ename
+  ( channel_t *ch, char *dst, size_t dstlen, const char *blank, uint32_t flags )
+{
+  size_t l = 0;
+  int64_t number;
+  char buf[128];
+  const char *s;
+
+  dst[0] = '\0';
+  if (flags & CHANNEL_ENAME_NUMBERS) {
+    number = channel_get_number(ch);
+    if (number > 0) {
+      if (number % CHANNEL_SPLIT) {
+        tvh_strlcatf(dst, dstlen, l, "%u.%u",
+                     channel_get_major(number),
+                     channel_get_minor(number));
+      } else {
+        tvh_strlcatf(dst, dstlen, l, "%u", channel_get_major(number));
+      }
+    }
+  }
+  s = channel_get_name(ch, blank);
+  if (s)
+    tvh_strlcatf(dst, dstlen, l, "%s%s", l > 0 ? " " : "", s);
+  if (flags & CHANNEL_ENAME_SOURCES) {
+    s = channel_get_source(ch, buf, sizeof(buf));
+    if (s)
+      tvh_strlcatf(dst, dstlen, l, "%s[%s]", l > 0 ? " " : "", s);
+  }
+  return dst;
 }
 
 int
@@ -699,24 +880,50 @@ channel_set_name ( channel_t *ch, const char *name )
   return save;
 }
 
-int64_t
-channel_get_number ( channel_t *ch )
+int
+channel_rename_and_save ( const char *from, const char *to )
 {
-  int64_t n = 0;
+  channel_t *ch;
+  const char *s;
+  int num_match = 0;
+
+  if (!from || !to || !*from || !*to)
+    return 0;
+
+  CHANNEL_FOREACH(ch) {
+    if (!ch->ch_enabled) continue;
+    s = channel_get_name(ch, NULL);
+    if (s == NULL) continue;
+    if (strcmp(s, from) == 0) {
+      ++num_match;
+      if (channel_set_name(ch, to)) {
+        idnode_changed(&ch->ch_id);
+      }
+    }
+  }
+  return num_match;
+}
+
+int64_t
+channel_get_number ( const channel_t *ch )
+{
+  int64_t n = 0, v;
   idnode_list_mapping_t *ilm;
   if (ch->ch_number) {
     n = ch->ch_number;
   } else {
     if (ch->ch_bouquet) {
       LIST_FOREACH(ilm, &ch->ch_services, ilm_in2_link) {
-        if ((n = bouquet_get_channel_number(ch->ch_bouquet, (service_t *)ilm->ilm_in1)))
-          break;
+        v = bouquet_get_channel_number(ch->ch_bouquet, (service_t *)ilm->ilm_in1);
+        if (v > 0 && (n == 0 || v < n))
+          n = v;
       }
     }
     if (n == 0) {
       LIST_FOREACH(ilm, &ch->ch_services, ilm_in2_link) {
-        if ((n = service_get_channel_number((service_t *)ilm->ilm_in1)))
-          break;
+        v = service_get_channel_number((service_t *)ilm->ilm_in1);
+        if (v > 0 && (n == 0 || v < n))
+          n = v;
       }
     }
   }
@@ -739,6 +946,54 @@ channel_set_number ( channel_t *ch, uint32_t major, uint32_t minor )
     save = 1;
   }
   return save;
+}
+
+char *
+channel_get_number_as_str ( channel_t *ch, char *dst, size_t dstlen )
+{
+  int64_t num = channel_get_number(ch);
+  uint32_t major, minor;
+  if (num == 0) return NULL;
+  major = channel_get_major(num);
+  minor = channel_get_minor(num);
+  if (minor)
+    snprintf(dst, dstlen, "%u.%u", major, minor);
+  else
+    snprintf(dst, dstlen, "%u", major);
+  return dst;
+}
+
+int64_t
+channel_get_number_from_str ( const char *str )
+{
+  return prop_intsplit_from_str(str, CHANNEL_SPLIT);
+}
+
+char *
+channel_get_source ( channel_t *ch, char *dst, size_t dstlen )
+{
+  const char *s;
+  idnode_list_mapping_t *ilm;
+  /* Unique sorted string list since many services with
+   * same source may be mapped so we want to avoid
+   * 'DVB-S, DVB-S, DVB-S'.
+   */
+  string_list_t *sources = string_list_create();
+  char *csv;
+  dst[0] = '\0';
+  LIST_FOREACH(ilm, &ch->ch_services, ilm_in2_link)
+    if ((s = service_get_source((service_t *)ilm->ilm_in1)))
+      string_list_insert(sources, s);
+  /* We own the returned list */
+  csv = string_list_2_csv(sources, ',', 1);
+  string_list_destroy(sources);
+  if (csv) {
+    strlcpy(dst, csv, dstlen);
+    free(csv);
+    return dst;
+  } else {
+    return NULL;
+  }
 }
 
 static char *
@@ -779,8 +1034,11 @@ svcnamepicons(const char *svcname)
 static int
 check_file( const char *url )
 {
-  if (url && !strncmp(url, "file://", 7))
-    return access(url + 7, R_OK) == 0;
+  if (url && !strncmp(url, "file://", 7)) {
+    char *s = tvh_strdupa(url + 7);
+    http_deescape(s);
+    return access(s, R_OK) == 0;
+  }
   return 1;
 }
 
@@ -793,10 +1051,10 @@ channel_get_icon ( channel_t *ch )
              *picon  = config.picon_path,
              *icon   = ch->ch_icon,
              *chname, *icn;
-  uint32_t id, i, pick, prefer = config.prefer_picon ? 1 : 0;
+  int i, pick, prefer = config.prefer_picon ? 1 : 0;
   char c;
 
-  if (icon && *icon == '\0')
+  if (tvh_str_default(icon, NULL) == NULL)
     icon = NULL;
 
   /*
@@ -825,14 +1083,12 @@ channel_get_icon ( channel_t *ch )
 
     /* No user icon - try to get the channel icon by name */
     if (!pick && chicon && chicon[0] >= ' ' && chicon[0] <= 122 &&
-        (chname = channel_get_name(ch)) != NULL && chname[0] &&
-        strcmp(chname, CHANNEL_BLANK_NAME)) {
+        (chname = channel_get_name(ch, NULL)) != NULL && chname[0]) {
       const char *chi, *send, *sname, *s;
       chi = strdup(chicon);
 
       /* Check for and replace placeholders */
-      if ((send = strstr(chi, "%C"))) {
-
+      if ((send = strstr(chi, "%C")) || (send = strstr(chi, "%c"))) {
         sname = intlconv_utf8safestr(intlconv_charset_id("ASCII", 1, 1),
                                      chname, strlen(chname) * 2);
         if (sname == NULL)
@@ -847,35 +1103,23 @@ channel_get_icon ( channel_t *ch )
           s = sname;
           while (s && *s) {
             c = *s;
-            if (c <= ' ' || c > 122 ||
-                strchr("/:\\<>|*?'\"", c) != NULL)
+            if (send[1] == 'C' && (c > 122 || strchr(":<>|*?'\"", c) != NULL))
               *(char *)s = '_';
             else if (config.chicon_scheme == CHICON_LOWERCASE && c >= 'A' && c <= 'Z')
               *(char *)s = c - 'A' + 'a';
             s++;
           }
         }
-
-      } else if ((send = strstr(chi, "%c"))) {
-
-        sname = intlconv_utf8safestr(intlconv_charset_id("ASCII", 1, 1),
-                                     chname, strlen(chname) * 2);
-
-        if (sname == NULL)
-          sname = strdup(chname);
+      } else if ((send = strstr(chi, "%U"))) {
+        sname = strdup(chname);
 
         if (config.chicon_scheme == CHICON_LOWERCASE) {
-          for (s = sname; *s; s++) {
-            c = *s;
-            if (c >= 'A' && c <= 'Z')
-              *(char *)s = c - 'A' + 'a';
-          }
+          utf8_lowercase_inplace((char *)sname);
         } else if (config.chicon_scheme == CHICON_SVCNAME) {
           s = svcnamepicons(sname);
           free((char *)sname);
           sname = (char *)s;
         }
-
       } else {
         buf[0] = '\0';
         sname = NULL;
@@ -883,18 +1127,28 @@ channel_get_icon ( channel_t *ch )
 
       if (send) {
         *(char *)send = '\0';
-        send += 2;
+        send = url_encode(send + 2);
       }
 
       if (sname) {
-        char *aname = url_encode(sname);
+        char *aname;
+
+        for (s = sname; *s == '.'; s++)
+          *(char *)s = '_';
+
+        for ( ; *s; s++)
+          if (*s == '/' || *s == '\\')
+            *(char *)s = '-';
+          else if (*s < ' ')
+            *(char *)s = '_';
+
+        aname = url_encode(sname);
         free((char *)sname);
         sname = aname;
       }
-      if (send)
-        send = url_encode(send);
 
       snprintf(buf, sizeof(buf), "%s%s%s", chi, sname ?: "", send ?: "");
+
       free((char *)sname);
       free((char *)send);
       free((char *)chi);
@@ -935,22 +1189,14 @@ found:
     icon = buf2;
   }
 
-  /* Lookup imagecache ID */
-  if ((id = imagecache_get_id(icon))) {
-    snprintf(buf, sizeof(buf), "imagecache/%d", id);
-  } else {
-    strncpy(buf, icon, sizeof(buf));
-    buf[sizeof(buf)-1] = '\0';
-  }
-
-  return buf;
+  return icon;
 }
 
 int channel_set_icon ( channel_t *ch, const char *icon )
 {
   int save = 0;
   if (!ch || !icon) return 0;
-  if (!ch->ch_icon || strcmp(ch->ch_icon, icon) ) {
+  if (!ch->ch_icon || strcmp(ch->ch_icon, icon)) {
     if (ch->ch_icon) free(ch->ch_icon);
     ch->ch_icon = strdup(icon);
     save = 1;
@@ -966,7 +1212,7 @@ channel_get_epgid ( channel_t *ch )
   LIST_FOREACH(ilm, &ch->ch_services, ilm_in2_link)
     if ((s = service_get_channel_epgid((service_t *)ilm->ilm_in1)))
       return s;
-  return channel_get_name(ch);
+  return channel_get_name(ch, NULL);
 }
 
 /* **************************************************************************
@@ -996,12 +1242,15 @@ channel_create0
     tvherror(LS_CHANNEL, "id collision!");
     abort();
   }
+  channels_count++;
 
   /* Defaults */
   ch->ch_enabled  = 1;
   ch->ch_autoname = 1;
   ch->ch_epgauto  = 1;
   ch->ch_epg_running = -1;
+
+  atomic_set(&ch->ch_changed_ref, 0);
 
   if (conf) {
     ch->ch_load = 1;
@@ -1022,7 +1271,7 @@ channel_create0
   htsp_channel_add(ch);
 
   /* determine icon URL */
-  (void)channel_get_icon(ch);
+  channel_load_icon(ch);
 
   return ch;
 }
@@ -1040,7 +1289,7 @@ channel_delete ( channel_t *ch, int delconf )
   idnode_save_check(&ch->ch_id, delconf);
 
   if (delconf)
-    tvhinfo(LS_CHANNEL, "%s - deleting", channel_get_name(ch));
+    tvhinfo(LS_CHANNEL, "%s - deleting", channel_get_name(ch, channel_blank_name));
 
   /* Tags */
   while((ilm = LIST_FIRST(&ch->ch_ctms)) != NULL)
@@ -1088,6 +1337,7 @@ channel_delete ( channel_t *ch, int delconf )
 
   /* Free memory */
   RB_REMOVE(&channels, ch, ch_link);
+  channels_count--;
   idnode_unlink(&ch->ch_id);
   free(ch->ch_epg_parent);
   free(ch->ch_name);
@@ -1096,9 +1346,82 @@ channel_delete ( channel_t *ch, int delconf )
 }
 
 /**
+ * sorting
+ */
+static int
+channel_cmp1(const void *a, const void *b)
+{
+  int r;
+  channel_t *c1 = *(channel_t **)a, *c2 = *(channel_t **)b;
+  int64_t n1 = channel_get_number(c1), n2 = channel_get_number(c2);
+  if (n1 > n2)
+    r = 1;
+  else if (n1 < n2)
+    r = -1;
+  else
+    r = strcasecmp(channel_get_name(c1, ""), channel_get_name(c2, ""));
+  return r;
+}
+
+static int
+channel_cmp2(const void *a, const void *b)
+{
+  channel_t *c1 = *(channel_t **)a, *c2 = *(channel_t **)b;
+  return strcasecmp(channel_get_name(c1, ""), channel_get_name(c2, ""));
+}
+
+static sortfcn_t *channel_sort_fcn(const char *sort_type)
+{
+  if (sort_type) {
+    if (!strcmp(sort_type, "numname"))
+      return &channel_cmp1;
+    if (!strcmp(sort_type, "name"))
+      return &channel_cmp2;
+  }
+  return &channel_cmp1;
+}
+
+channel_t **
+channel_get_sorted_list(const char *sort_type, int all, int *_count)
+{
+  int count = 0;
+  channel_t *ch, **chlist = malloc(channels_count * sizeof(channel_t *));
+
+  CHANNEL_FOREACH(ch)
+    if (all || ch->ch_enabled)
+      chlist[count++] = ch;
+
+  assert(count <= channels_count);
+  qsort(chlist, count, sizeof(channel_t *), channel_sort_fcn(sort_type));
+
+  *_count = count;
+  return chlist;
+}
+
+channel_t **
+channel_get_sorted_list_for_tag
+  (const char *sort_type, channel_tag_t *tag, int *_count)
+{
+  int count = 0;
+  channel_t *ch, **chlist = malloc(channels_count * sizeof(channel_t *));
+  idnode_list_mapping_t *ilm;
+
+  LIST_FOREACH(ilm, &tag->ct_ctms, ilm_in1_link) {
+    ch = (channel_t *)ilm->ilm_in2;
+    if (ch->ch_enabled)
+      chlist[count++] = ch;
+  }
+
+  assert(count <= channels_count);
+  qsort(chlist, count, sizeof(channel_t *), channel_sort_fcn(sort_type));
+
+  *_count = count;
+  return chlist;
+}
+
+/**
  *
  */
-
 static void channels_memoryinfo_update(memoryinfo_t *my)
 {
   channel_t *ch;
@@ -1131,6 +1454,7 @@ channel_init ( void )
   channel_t *ch, *parent;
   char *s;
 
+  channels_count = 0;
   RB_INIT(&channels);
   memoryinfo_register(&channels_memoryinfo);
   idclass_register(&channel_class);
@@ -1146,7 +1470,7 @@ channel_init ( void )
   channel_in_load = 1;
   HTSMSG_FOREACH(f, c) {
     if (!(e = htsmsg_field_get_map(f))) continue;
-    (void)channel_create(f->hmf_name, e, NULL);
+    (void)channel_create(htsmsg_field_name(f), e, NULL);
   }
   channel_in_load = 0;
   htsmsg_destroy(c);
@@ -1170,11 +1494,11 @@ channel_done ( void )
 {
   channel_t *ch;
 
-  pthread_mutex_lock(&global_lock);
+  tvh_mutex_lock(&global_lock);
   while ((ch = RB_FIRST(&channels)) != NULL)
     channel_delete(ch, 0);
   memoryinfo_unregister(&channels_memoryinfo);
-  pthread_mutex_unlock(&global_lock);
+  tvh_mutex_unlock(&global_lock);
   channel_tag_done();
 }
 
@@ -1278,6 +1602,7 @@ channel_tag_create(const char *uuid, htsmsg_t *conf)
   htsp_tag_add(ct);
 
   TAILQ_INSERT_TAIL(&channel_tags, ct, ct_link);
+  channel_tags_count++;
   return ct;
 }
 
@@ -1302,6 +1627,7 @@ channel_tag_destroy(channel_tag_t *ct, int delconf)
   htsp_tag_delete(ct);
 
   TAILQ_REMOVE(&channel_tags, ct, ct_link);
+  channel_tags_count--;
   idnode_unlink(&ct->ct_id);
 
   bouquet_destroy_by_channel_tag(ct);
@@ -1320,16 +1646,7 @@ channel_tag_destroy(channel_tag_t *ct, int delconf)
 const char *
 channel_tag_get_icon(channel_tag_t *ct)
 {
-  static char buf[64];
-  const char *icon  = ct->ct_icon;
-  uint32_t id;
-
-  /* Lookup imagecache ID */
-  if ((id = imagecache_get_id(icon))) {
-    snprintf(buf, sizeof(buf), "imagecache/%d", id);
-    return buf;
-  }
-  return icon;
+  return ct->ct_icon;
 }
 
 /**
@@ -1338,6 +1655,10 @@ channel_tag_get_icon(channel_tag_t *ct)
 int
 channel_tag_access(channel_tag_t *ct, access_t *a, int disabled)
 {
+  htsmsg_field_t *f;
+  char ubuf[UUID_HEX_SIZE];
+  const char *uuid = idnode_uuid_as_str(&ct->ct_id, ubuf);
+
   if (!ct)
     return 0;
 
@@ -1348,17 +1669,17 @@ channel_tag_access(channel_tag_t *ct, access_t *a, int disabled)
     return 1;
 
   /* Channel tag check */
+  if (a->aa_chtags_exclude) {
+    HTSMSG_FOREACH(f, a->aa_chtags_exclude)
+      if (!strcmp(htsmsg_field_get_str(f) ?: "", uuid))
+        return 0;
+  }
   if (a->aa_chtags) {
-    htsmsg_field_t *f;
-    char ubuf[UUID_HEX_SIZE];
-    const char *uuid = idnode_uuid_as_str(&ct->ct_id, ubuf);
     HTSMSG_FOREACH(f, a->aa_chtags)
       if (!strcmp(htsmsg_field_get_str(f) ?: "", uuid))
-        goto chtags_ok;
+        return 1;
     return 0;
   }
-chtags_ok:
-
   return 1;
 }
 
@@ -1380,7 +1701,8 @@ channel_tag_class_save(idnode_t *self, char *filename, size_t fsize)
   htsmsg_t *c = htsmsg_create_map();
   char ubuf[UUID_HEX_SIZE];
   idnode_save(&ct->ct_id, c);
-  snprintf(filename, fsize, "channel/tag/%s", idnode_uuid_as_str(&ct->ct_id, ubuf));
+  if (filename)
+    snprintf(filename, fsize, "channel/tag/%s", idnode_uuid_as_str(&ct->ct_id, ubuf));
   return c;
 }
 
@@ -1390,25 +1712,27 @@ channel_tag_class_delete(idnode_t *self)
   channel_tag_destroy((channel_tag_t *)self, 1);
 }
 
-static const char *
-channel_tag_class_get_title (idnode_t *self, const char *lang)
+static void
+channel_tag_class_get_title
+  (idnode_t *self, const char *lang, char *dst, size_t dstsize)
 {
   channel_tag_t *ct = (channel_tag_t *)self;
-  return ct->ct_name ?: "";
+  snprintf(dst, dstsize, "%s", ct->ct_name ?: "");
 }
 
 static void
 channel_tag_class_icon_notify ( void *obj, const char *lang )
 {
-  (void)channel_tag_get_icon(obj);
+  channel_tag_load_icon(obj);
 }
 
 static const void *
 channel_tag_class_get_icon ( void *obj )
 {
-  static const char *s;
-  s = channel_tag_get_icon(obj);
-  return &s;
+  prop_ptr = channel_tag_get_icon(obj);
+  if (!strempty(prop_ptr))
+    prop_ptr = imagecache_get_propstr(prop_ptr, prop_sbuf, PROP_SBUF_LEN);
+  return &prop_ptr;
 }
 
 /* exported for others */
@@ -1429,7 +1753,7 @@ CLASS_DOC(channeltag)
 
 const idclass_t channel_tag_class = {
   .ic_class      = "channeltag",
-  .ic_caption    = N_("Channel Tags"),
+  .ic_caption    = N_("Channels / EPG - Channel Tags"),
   .ic_doc        = tvh_doc_channeltag_class,
   .ic_event      = "channeltag",
   .ic_changed    = channel_tag_class_changed,
@@ -1524,7 +1848,7 @@ channel_tag_find_by_name(const char *name, int create)
 {
   channel_tag_t *ct;
 
-  if (name == NULL || *name == '\0')
+  if (tvh_str_default(name, NULL) == NULL)
     return NULL;
 
   TAILQ_FOREACH(ct, &channel_tags, ct_link)
@@ -1542,12 +1866,11 @@ channel_tag_find_by_name(const char *name, int create)
   return ct;
 }
 
-
 /**
  *
  */
 channel_tag_t *
-channel_tag_find_by_identifier(uint32_t id) {
+channel_tag_find_by_id(uint32_t id) {
   channel_tag_t *ct;
 
   TAILQ_FOREACH(ct, &channel_tags, ct_link) {
@@ -1561,7 +1884,55 @@ channel_tag_find_by_identifier(uint32_t id) {
 /**
  *
  */
+static int
+channel_tag_cmp1(const void *a, const void *b)
+{
+  channel_tag_t *ct1 = *(channel_tag_t **)a, *ct2 = *(channel_tag_t **)b;
+  int r = ct1->ct_index - ct2->ct_index;
+  if (r == 0)
+    r = strcasecmp(ct1->ct_name, ct2->ct_name);
+  return r;
+}
 
+static int
+channel_tag_cmp2(const void *a, const void *b)
+{
+  channel_tag_t *ct1 = *(channel_tag_t **)a, *ct2 = *(channel_tag_t **)b;
+  return strcasecmp(ct1->ct_name, ct2->ct_name);
+}
+
+static sortfcn_t *channel_tag_sort_fcn(const char *sort_type)
+{
+  if (sort_type) {
+    if (!strcmp(sort_type, "idxname"))
+      return &channel_tag_cmp1;
+    if (!strcmp(sort_type, "name"))
+      return &channel_tag_cmp2;
+  }
+  return &channel_tag_cmp1;
+}
+
+channel_tag_t **
+channel_tag_get_sorted_list(const char *sort_type, int *_count)
+{
+  int count = 0;
+  channel_tag_t *ct, **ctlist;
+
+  ctlist = malloc(channel_tags_count * sizeof(channel_tag_t *));
+
+  TAILQ_FOREACH(ct, &channel_tags, ct_link)
+    if(ct->ct_enabled && !ct->ct_internal)
+      ctlist[count++] = ct;
+
+  assert(count <= channel_tags_count);
+  qsort(ctlist, count, sizeof(channel_tag_t *), channel_tag_sort_fcn(sort_type));
+
+  *_count = count;
+  return ctlist;
+}
+/**
+ *
+ */
 static void channel_tags_memoryinfo_update(memoryinfo_t *my)
 {
   channel_tag_t *ct;
@@ -1594,11 +1965,12 @@ channel_tag_init ( void )
   htsmsg_field_t *f;
 
   memoryinfo_register(&channel_tags_memoryinfo);
+  channel_tags_count = 0;
   TAILQ_INIT(&channel_tags);
   if ((c = hts_settings_load("channel/tag")) != NULL) {
     HTSMSG_FOREACH(f, c) {
       if (!(m = htsmsg_field_get_map(f))) continue;
-      (void)channel_tag_create(f->hmf_name, m);
+      (void)channel_tag_create(htsmsg_field_name(f), m);
     }
     htsmsg_destroy(c);
   }
@@ -1609,8 +1981,28 @@ channel_tag_done ( void )
 {
   channel_tag_t *ct;
 
-  pthread_mutex_lock(&global_lock);
+  tvh_mutex_lock(&global_lock);
   while ((ct = TAILQ_FIRST(&channel_tags)) != NULL)
     channel_tag_destroy(ct, 0);
-  pthread_mutex_unlock(&global_lock);
+  tvh_mutex_unlock(&global_lock);
+}
+
+int
+channel_has_correct_service_filter(const channel_t *ch, int svf)
+{
+  const idnode_list_mapping_t *ilm;
+  const service_t *service;
+  if (!ch || !svf || svf == PROFILE_SVF_NONE)
+    return 1;
+
+  LIST_FOREACH(ilm, &ch->ch_services, ilm_in2_link) {
+    service = (const service_t*)ilm->ilm_in1;
+    if ((svf == PROFILE_SVF_SD && service_is_sdtv(service)) ||
+        (svf == PROFILE_SVF_HD && service_is_hdtv(service)) ||
+        (svf == PROFILE_SVF_FHD && service_is_fhdtv(service)) ||
+        (svf == PROFILE_SVF_UHD && service_is_uhdtv(service))) {
+      return 1;
+    }
+  }
+  return 0;
 }

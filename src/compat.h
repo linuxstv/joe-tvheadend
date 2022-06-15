@@ -18,16 +18,11 @@
 #ifndef TVH_COMPAT_H
 #define TVH_COMPAT_H
 
-#if ENABLE_ANDROID
-#ifndef strdupa
-#define strdupa(s)                                                            \
-    ({                                                                        \
-      const char *__old = (s);                                                \
-      size_t __len = strlen(__old) + 1;                                       \
-      char *__new = (char *) alloca(__len);                                   \
-      (char *) memcpy(__new, __old, __len);                                   \
-    })
+#if ENABLE_LOCKOWNER || ENABLE_ANDROID
+#include <sys/syscall.h>
 #endif
+
+#if ENABLE_ANDROID
 #ifndef index
 #define index(...) strchr(__VA_ARGS__)
 #endif
@@ -46,6 +41,10 @@
 #endif
 #ifndef ENABLE_INOTIFY_INIT1
 #define inotify_init1(IN_CLOEXEC) inotify_init()
+#endif
+
+#if (defined(PLATFORM_DARWIN) || defined(PLATFORM_FREEBSD)) && !defined(MSG_MORE)
+#define MSG_MORE 0
 #endif
 
 #endif /* TVH_COMPAT_H */

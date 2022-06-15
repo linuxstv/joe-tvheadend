@@ -31,9 +31,9 @@ static int
 api_mapper_stop
   ( access_t *perm, void *opaque, const char *op, htsmsg_t *args, htsmsg_t **resp )
 {
-  pthread_mutex_lock(&global_lock);
+  tvh_mutex_lock(&global_lock);
   service_mapper_stop();
-  pthread_mutex_unlock(&global_lock);
+  tvh_mutex_unlock(&global_lock);
 
   return 0;
 }
@@ -42,7 +42,6 @@ static htsmsg_t *
 api_mapper_status_msg ( void )
 {
   htsmsg_t *m;
-  char ubuf[UUID_HEX_SIZE];
   service_mapper_status_t stat = service_mapper_status();
   m = htsmsg_create_map();
   htsmsg_add_u32(m, "total",  stat.total);
@@ -50,7 +49,7 @@ api_mapper_status_msg ( void )
   htsmsg_add_u32(m, "fail",   stat.fail);
   htsmsg_add_u32(m, "ignore", stat.ignore);
   if (stat.active)
-    htsmsg_add_str(m, "active", idnode_uuid_as_str(&stat.active->s_id, ubuf));
+    htsmsg_add_uuid(m, "active", &stat.active->s_id.in_uuid);
   return m;
 }
 
@@ -58,9 +57,9 @@ static int
 api_mapper_status
   ( access_t *perm, void *opaque, const char *op, htsmsg_t *args, htsmsg_t **resp )
 {
-  pthread_mutex_lock(&global_lock);
+  tvh_mutex_lock(&global_lock);
   *resp = api_mapper_status_msg();
-  pthread_mutex_unlock(&global_lock);
+  tvh_mutex_unlock(&global_lock);
   return 0;
 }
 
@@ -112,7 +111,7 @@ api_service_streams
   ( access_t *perm, void *opaque, const char *op, htsmsg_t *args, htsmsg_t **resp )
 {
   const char *uuid;
-  htsmsg_t *e, *st, *stf;
+  htsmsg_t *e, *st, *stf, *hbbtv = NULL;
   service_t *s;
   elementary_stream_t *es;
 
@@ -120,45 +119,53 @@ api_service_streams
   if (!(uuid = htsmsg_get_str(args, "uuid")))
     return EINVAL;
 
-  pthread_mutex_lock(&global_lock);
+  tvh_mutex_lock(&global_lock);
 
   /* Couldn't find */
-  if (!(s = service_find(uuid))) {
-    pthread_mutex_unlock(&global_lock);
+  if (!(s = service_find_by_uuid(uuid))) {
+    tvh_mutex_unlock(&global_lock);
     return EINVAL;
   }
 
   /* Build response */
-  pthread_mutex_lock(&s->s_stream_mutex);
+  tvh_mutex_lock(&s->s_stream_mutex);
   st = htsmsg_create_list();
   stf = htsmsg_create_list();
-  if (s->s_pcr_pid) {
+  if (s->s_components.set_pcr_pid) {
     e = htsmsg_create_map();
-    htsmsg_add_u32(e, "pid", s->s_pcr_pid);
+    htsmsg_add_u32(e, "pid", s->s_components.set_pcr_pid);
     htsmsg_add_str(e, "type", "PCR");
     htsmsg_add_msg(st, NULL, e);
   }
-  if (s->s_pmt_pid) {
+  if (s->s_components.set_pmt_pid) {
     e = htsmsg_create_map();
-    htsmsg_add_u32(e, "pid", s->s_pmt_pid);
+    htsmsg_add_u32(e, "pid", s->s_components.set_pmt_pid);
     htsmsg_add_str(e, "type", "PMT");
     htsmsg_add_msg(st, NULL, e);
   }
-  TAILQ_FOREACH(es, &s->s_components, es_link)
+  TAILQ_FOREACH(es, &s->s_components.set_all, es_link) {
+    if (es->es_type == SCT_PCR) continue;
     htsmsg_add_msg(st, NULL, api_service_streams_get_one(es, 0));
-  if (TAILQ_FIRST(&s->s_filt_components) == NULL ||
-      s->s_status == SERVICE_IDLE)
-    service_build_filter(s);
-  TAILQ_FOREACH(es, &s->s_filt_components, es_filt_link)
+  }
+  if (elementary_set_has_streams(&s->s_components, 1) || s->s_status == SERVICE_IDLE)
+    elementary_set_filter_build(&s->s_components);
+  TAILQ_FOREACH(es, &s->s_components.set_filter, es_filter_link) {
+    if (es->es_type == SCT_PCR) continue;
     htsmsg_add_msg(stf, NULL, api_service_streams_get_one(es, 1));
+  }
   *resp = htsmsg_create_map();
   htsmsg_add_str(*resp, "name", s->s_nicename);
+  if (s->s_hbbtv)
+    hbbtv = htsmsg_copy(s->s_hbbtv);
+  tvh_mutex_unlock(&s->s_stream_mutex);
+
   htsmsg_add_msg(*resp, "streams", st);
   htsmsg_add_msg(*resp, "fstreams", stf);
-  pthread_mutex_unlock(&s->s_stream_mutex);
+  if (hbbtv)
+    htsmsg_add_msg(*resp, "hbbtv", hbbtv);
 
   /* Done */
-  pthread_mutex_unlock(&global_lock);
+  tvh_mutex_unlock(&global_lock);
   return 0;
 }
 
@@ -169,9 +176,9 @@ api_service_remove_unseen
   int days = htsmsg_get_s32_or_default(args, "days", 7);
   const char *type = htsmsg_get_str(args, "type");
 
-  pthread_mutex_lock(&global_lock);
+  tvh_mutex_lock(&global_lock);
   service_remove_unseen(type, days);
-  pthread_mutex_unlock(&global_lock);
+  tvh_mutex_unlock(&global_lock);
   return 0;
 }
 

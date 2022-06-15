@@ -16,13 +16,7 @@
  *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <assert.h>
-#include <pthread.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <string.h>
-#include <errno.h>
+#include <ctype.h>
 
 #include "tvheadend.h"
 #include "channels.h"
@@ -98,10 +92,10 @@ service_mapper_start ( const service_mapper_conf_t *conf, htsmsg_t *uuids )
     tvhtrace(LS_SERVICE_MAPPER, "  enabled");
 
     /* Get service info */
-    pthread_mutex_lock(&s->s_stream_mutex);
+    tvh_mutex_lock(&s->s_stream_mutex);
     e  = service_is_encrypted(s);
     tr = service_is_tv(s) || service_is_radio(s);
-    pthread_mutex_unlock(&s->s_stream_mutex);
+    tvh_mutex_unlock(&s->s_stream_mutex);
 
     /* Skip non-TV / Radio */
     if (!tr) continue;
@@ -206,6 +200,7 @@ service_mapper_process
 {
   channel_t *chn = NULL;
   const char *name, *tagname;
+  char *tidy_name = NULL;
   htsmsg_field_t *f;
   htsmsg_t *m;
 
@@ -224,9 +219,57 @@ service_mapper_process
 
   /* Find existing channel */
   name = service_get_channel_name(s);
-  if (!bq && conf->merge_same_name && name && *name)
-    chn = channel_find_by_name(name);
-  if (!chn) {
+
+  if (conf->tidy_channel_name && name) {
+    size_t len = strlen(name);
+    if (len > 2) {
+      // E.g.,
+      // 012345
+      // 5 UHD\0 len=5, UHD at pos 2 (5-3)
+      // 5 HD\0  len=4,  HD at pos 2 (4-2)
+      // 4HD\0   len=3,  HD at pos 1 (3-2)
+      // 4\0     len=1
+      if (name[len-2] == 'H' && name[len-1] == 'D') {
+        /* Ends in HD but does it end in UHD/FHD? */
+        tidy_name = tvh_strdupa(name);
+        if (len > 3 && (name[len-3] == 'U' || name[len-3] == 'F'))
+          tidy_name[len-3] = 0;
+        else
+          tidy_name[len-2] = 0;
+        len = strlen(tidy_name);
+        /* Strip any trailing space such as '5 HD' should become
+         * '5'  not '5 '.
+         */
+        if (len && isspace(tidy_name[len-1]))
+          tidy_name[len-1] = 0;
+
+        tvhdebug(bq ? LS_BOUQUET : LS_SERVICE_MAPPER,
+                 "%s: generated tidy_name [%s] from [%s]",
+                 s->s_nicename, tidy_name, name);
+
+        /* Assign tidy_name so we use it for rest of function */
+        name = tidy_name;
+      }
+    }
+  }
+
+  if (conf->merge_same_name && name && *name) {
+    /* Try exact match first */
+    chn = channel_find_by_name_and_bouquet(name, bq);
+    if (!chn && conf->merge_same_name_fuzzy) {
+      chn = channel_find_by_name_bouquet_fuzzy(name, bq);
+    }
+  }
+  /* If using bouquets then we want to only merge
+   * with channels on the same bouquet. This is because
+   * you can disable all channels on a bouquet through
+   * the bouquet menu so if we merged between bouquets then
+   * you'd get odd results.
+   *
+   * The chn should already be for the correct bouquet
+   * but we'll safety-check here.
+   */
+  if (!chn || (bq && chn->ch_bouquet != bq)) {
     chn = channel_create(NULL, NULL, NULL);
     chn->ch_bouquet = bq;
   }
@@ -236,11 +279,30 @@ service_mapper_process
     const char *prov;
     service_mapper_link(s, chn, chn);
 
+    /* We have to set tidy name here (not in channel_create) because
+     * the service_mapper_link alters the detected channel name when
+     * we merge a channel. So, on the initial create the
+     * channel_create could be given a channel name (such as mapping
+     * "5 HD" to "5") and a subsequent merge of "5" would be ok since
+     * we wanted HD stripped. But if the order were reversed and we
+     * found "5" first and then "5 HD" then we don't channel_create
+     * for "5 HD" and the service_mapper_link then uses "5 HD" as the
+     * name.
+     *
+     * We only set the name if we explicitly have a tidy name.
+     * Otherwise we let channel use the defaults.
+     */
+    if (tidy_name && *tidy_name)
+      channel_set_name(chn, tidy_name);
+
     /* Type tags */
     if (conf->type_tags) {
       if (service_is_uhdtv(s)) {
         channel_tag_map(channel_tag_find_by_name("TV channels", 1), chn, chn);
         channel_tag_map(channel_tag_find_by_name("UHDTV", 1), chn, chn);
+      } else if (service_is_fhdtv(s)) {
+        channel_tag_map(channel_tag_find_by_name("TV channels", 1), chn, chn);
+        channel_tag_map(channel_tag_find_by_name("FHDTV", 1), chn, chn);
       } else if (service_is_hdtv(s)) {
         channel_tag_map(channel_tag_find_by_name("TV channels", 1), chn, chn);
         channel_tag_map(channel_tag_find_by_name("HDTV", 1), chn, chn);
@@ -297,16 +359,17 @@ service_mapper_thread ( void *aux )
   service_mapper_item_t *smi;
   profile_chain_t prch;
   th_subscription_t *sub;
-  int run, working = 0;
+  int run, working = 0, r;
   streaming_queue_t *sq;
   streaming_message_t *sm;
   const char *err = NULL;
+  uint64_t timeout, timeout_other;
 
-  profile_chain_init(&prch, NULL, NULL);
+  profile_chain_init(&prch, NULL, NULL, 1);
   prch.prch_st = &prch.prch_sq.sq_st;
   sq = &prch.prch_sq;
 
-  pthread_mutex_lock(&global_lock);
+  tvh_mutex_lock(&global_lock);
 
   while (tvheadend_is_running()) {
     
@@ -349,50 +412,77 @@ service_mapper_thread ( void *aux )
     service_ref(s);
     service_mapper_stat.active = s;
     api_service_mapper_notify();
-    pthread_mutex_unlock(&global_lock);
+    tvh_mutex_unlock(&global_lock);
 
     /* Wait */
     run = 1;
-    pthread_mutex_lock(&sq->sq_mutex);
+    timeout = mclk() + sec2mono(30);
+    timeout_other = mclk() + sec2mono(5);
     while(tvheadend_is_running() && run) {
 
+      if (timeout < mclk()) {
+        run = 0;
+        err = streaming_code2txt(SM_CODE_DATA_TIMEOUT);
+        break;
+      }
+
+      if (timeout_other < mclk()) {
+        tvh_mutex_lock(&global_lock);
+        r = service_is_other(s);
+        tvh_mutex_unlock(&global_lock);
+        if (r) {
+          run = 0;
+          err = streaming_code2txt(SM_CODE_OTHER_SERVICE);
+          break;
+        }
+      }
+
       /* Wait for message */
+      tvh_mutex_lock(&sq->sq_mutex);
       while((sm = TAILQ_FIRST(&sq->sq_queue)) == NULL) {
         tvh_cond_wait(&sq->sq_cond, &sq->sq_mutex);
         if (!tvheadend_is_running())
           break;
       }
+      if (sm)
+        streaming_queue_remove(sq, sm);
+      tvh_mutex_unlock(&sq->sq_mutex);
       if (!tvheadend_is_running())
         break;
 
-      streaming_queue_remove(sq, sm);
-      pthread_mutex_unlock(&sq->sq_mutex);
-
-      if(sm->sm_type == SMT_PACKET) {
+      switch (sm->sm_type) {
+      case SMT_GRACE:
+        timeout += sec2mono(sm->sm_code);
+        timeout_other = sec2mono(sm->sm_code);
+        break;
+      case SMT_PACKET:
         run = 0;
         err = NULL;
-      } else if (sm->sm_type == SMT_SERVICE_STATUS) {
-        int status = sm->sm_code;
-
-        if(status & TSS_ERRORS) {
+        break;
+      case SMT_SERVICE_STATUS:
+        if(sm->sm_code & TSS_ERRORS) {
           run = 0;
-          err = service_tss2text(status);
+          err = service_tss2text(sm->sm_code);
         }
-      } else if (sm->sm_type == SMT_NOSTART) {
+        break;
+      case SMT_NOSTART:
         run = 0;
         err = streaming_code2txt(sm->sm_code);
+        break;
+      default:
+        break;
       }
 
       streaming_msg_free(sm);
-      pthread_mutex_lock(&sq->sq_mutex);
     }
     if (!tvheadend_is_running())
       break;
 
+    tvh_mutex_lock(&sq->sq_mutex);
     streaming_queue_clear(&sq->sq_queue);
-    pthread_mutex_unlock(&sq->sq_mutex);
+    tvh_mutex_unlock(&sq->sq_mutex);
  
-    pthread_mutex_lock(&global_lock);
+    tvh_mutex_lock(&global_lock);
     subscription_unsubscribe(sub, UNSUBSCRIBE_FINAL);
 
     if(err) {
@@ -406,7 +496,7 @@ service_mapper_thread ( void *aux )
     api_service_mapper_notify();
   }
 
-  pthread_mutex_unlock(&global_lock);
+  tvh_mutex_unlock(&global_lock);
   profile_chain_close(&prch);
   return NULL;
 }
@@ -431,7 +521,8 @@ service_mapper_conf_class_save ( idnode_t *self, char *filename, size_t fsize )
 
   m = htsmsg_create_map();
   idnode_save(&service_mapper_conf.idnode, m);
-  snprintf(filename, fsize, "service_mapper/config");
+  if (filename)
+    snprintf(filename, fsize, "service_mapper/config");
 
   if (!htsmsg_is_empty(service_mapper_conf.services))
     service_mapper_start(&service_mapper_conf.d, service_mapper_conf.services);
@@ -505,8 +596,10 @@ static const idclass_t service_mapper_conf_class = {
       .type   = PT_BOOL,
       .id     = "check_availability",
       .name   = N_("Check availability"),
-      .desc   = N_("Check service availability (add live services "
-                   "only)."),
+      .desc   = N_("Check services for availability. If enabled, "
+                   "services that are not currently broadcasting (or "
+                   "can't be decrypted) will be ignored. Leave disabled "
+                   "if you want Tvheadend to also map offline services."),
       .off    = offsetof(service_mapper_t, d.check_availability),
       .opts   = PO_ADVANCED
     },
@@ -522,8 +615,32 @@ static const idclass_t service_mapper_conf_class = {
       .type   = PT_BOOL,
       .id     = "merge_same_name",
       .name   = N_("Merge same name"),
-      .desc   = N_("Merge services with the same name to one channel."),
+      .desc   = N_("Merge services with the same name into one channel."),
       .off    = offsetof(service_mapper_t, d.merge_same_name),
+    },
+    {
+      .type   = PT_BOOL,
+      .id     = "merge_same_name_fuzzy",
+      .name   = N_("Use fuzzy mapping if merging same name"),
+      .desc   = N_("If merge same name is enabled then "
+                   "merge services with the same name into one channel but "
+                   "using fuzzy logic such as ignoring whitespace, case and "
+                   "some channel suffixes such as HD. So 'Channel 5+1', "
+                   "'Channel 5 +1', 'Channel 5+1HD' and 'Channel 5 +1HD' would "
+                   "all merge in to the same channel. The exact name chosen "
+                   "depends on the order the channels are mapped."),
+      .off    = offsetof(service_mapper_t, d.merge_same_name_fuzzy),
+    },
+    {
+      .type   = PT_BOOL,
+      .id     = "tidy_channel_name",
+      .name   = N_("Tidy the channel name such as removing trailing HD text"),
+      .desc   = N_("Some broadcasters distinguish channels by appending "
+                   "descriptors such as 'HD'. This option strips those "
+                   "so 'Channel 4 HD' would be named 'Channel 4'. "
+                   "Note that xmltv settings may try and match by channel name "
+                   "so changing a channel name may require manual xmltv mapping."),
+      .off    = offsetof(service_mapper_t, d.tidy_channel_name),
     },
     {
       .type   = PT_BOOL,
@@ -565,8 +682,8 @@ void service_mapper_init ( void )
 
   TAILQ_INIT(&service_mapper_queue);
   idclass_register(&service_mapper_conf_class);
-  tvh_cond_init(&service_mapper_cond);
-  tvhthread_create(&service_mapper_tid, NULL, service_mapper_thread, NULL, "svcmap");
+  tvh_cond_init(&service_mapper_cond, 1);
+  tvh_thread_create(&service_mapper_tid, NULL, service_mapper_thread, NULL, "svcmap");
 
   /* Defaults */
   memset(&service_mapper_conf, 0, sizeof(service_mapper_conf));

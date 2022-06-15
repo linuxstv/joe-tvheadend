@@ -21,7 +21,9 @@
 #include <stdint.h>
 #include <time.h>
 
-extern pthread_mutex_t atomic_lock;
+typedef void * volatile * atomic_refptr_t;
+
+extern tvh_mutex_t atomic_lock;
 
 /*
  * Atomic FETCH and ADD operation
@@ -30,7 +32,16 @@ extern pthread_mutex_t atomic_lock;
 static inline int
 atomic_add(volatile int *ptr, int incr)
 {
+#if ENABLE_ATOMIC32
   return __sync_fetch_and_add(ptr, incr);
+#else
+  int ret;
+  tvh_mutex_lock(&atomic_lock);
+  ret = *ptr;
+  *ptr += incr;
+  tvh_mutex_unlock(&atomic_lock);
+  return ret;
+#endif
 }
 
 static inline uint64_t
@@ -40,10 +51,10 @@ atomic_add_u64(volatile uint64_t *ptr, uint64_t incr)
   return __sync_fetch_and_add(ptr, incr);
 #else
   uint64_t ret;
-  pthread_mutex_lock(&atomic_lock);
+  tvh_mutex_lock(&atomic_lock);
   ret = *ptr;
   *ptr += incr;
-  pthread_mutex_unlock(&atomic_lock);
+  tvh_mutex_unlock(&atomic_lock);
   return ret;
 #endif
 }
@@ -55,10 +66,10 @@ atomic_add_s64(volatile int64_t *ptr, int64_t incr)
   return __sync_fetch_and_add(ptr, incr);
 #else
   uint64_t ret;
-  pthread_mutex_lock(&atomic_lock);
+  tvh_mutex_lock(&atomic_lock);
   ret = *ptr;
   *ptr += incr;
-  pthread_mutex_unlock(&atomic_lock);
+  tvh_mutex_unlock(&atomic_lock);
   return ret;
 #endif
 }
@@ -70,10 +81,10 @@ atomic_add_time_t(volatile time_t *ptr, time_t incr)
   return __sync_fetch_and_add(ptr, incr);
 #else
   time_t ret;
-  pthread_mutex_lock(&atomic_lock);
+  tvh_mutex_lock(&atomic_lock);
   ret = *ptr;
   *ptr += incr;
-  pthread_mutex_unlock(&atomic_lock);
+  tvh_mutex_unlock(&atomic_lock);
   return ret;
 #endif
 }
@@ -89,10 +100,10 @@ atomic_pre_add_s64(volatile int64_t *ptr, int64_t incr)
   return __sync_add_and_fetch(ptr, incr);
 #else
   int64_t ret;
-  pthread_mutex_lock(&atomic_lock);
+  tvh_mutex_lock(&atomic_lock);
   *ptr += incr;
   ret = *ptr;
-  pthread_mutex_unlock(&atomic_lock);
+  tvh_mutex_unlock(&atomic_lock);
   return ret;
 #endif
 }
@@ -104,10 +115,10 @@ atomic_pre_add_u64(volatile uint64_t *ptr, uint64_t incr)
   return __sync_add_and_fetch(ptr, incr);
 #else
   uint64_t ret;
-  pthread_mutex_lock(&atomic_lock);
+  tvh_mutex_lock(&atomic_lock);
   *ptr += incr;
   ret = *ptr;
-  pthread_mutex_unlock(&atomic_lock);
+  tvh_mutex_unlock(&atomic_lock);
   return ret;
 #endif
 }
@@ -127,12 +138,12 @@ atomic_pre_add_s64_peak(volatile int64_t *ptr, int64_t incr,
   return ret;
 #else
   int64_t ret;
-  pthread_mutex_lock(&atomic_lock);
+  tvh_mutex_lock(&atomic_lock);
   *ptr += incr;
   ret = *ptr;
   if (*peak < ret)
     *peak = ret;
-  pthread_mutex_unlock(&atomic_lock);
+  tvh_mutex_unlock(&atomic_lock);
   return ret;
 #endif
 }
@@ -144,7 +155,16 @@ atomic_pre_add_s64_peak(volatile int64_t *ptr, int64_t incr,
 static inline int
 atomic_dec(volatile int *ptr, int decr)
 {
+#if ENABLE_ATOMIC32
   return __sync_fetch_and_sub(ptr, decr);
+#else
+  int ret;
+  tvh_mutex_lock(&atomic_lock);
+  ret = *ptr;
+  *ptr -= decr;
+  tvh_mutex_unlock(&atomic_lock);
+  return ret;
+#endif
 }
 
 static inline uint64_t
@@ -154,10 +174,10 @@ atomic_dec_u64(volatile uint64_t *ptr, uint64_t decr)
   return __sync_fetch_and_sub(ptr, decr);
 #else
   uint64_t ret;
-  pthread_mutex_lock(&atomic_lock);
+  tvh_mutex_lock(&atomic_lock);
   ret = *ptr;
   *ptr -= decr;
-  pthread_mutex_unlock(&atomic_lock);
+  tvh_mutex_unlock(&atomic_lock);
   return ret;
 #endif
 }
@@ -169,10 +189,10 @@ atomic_dec_s64(volatile int64_t *ptr, int64_t decr)
   return __sync_fetch_and_sub(ptr, decr);
 #else
   int64_t ret;
-  pthread_mutex_lock(&atomic_lock);
+  tvh_mutex_lock(&atomic_lock);
   ret = *ptr;
   *ptr -= decr;
-  pthread_mutex_unlock(&atomic_lock);
+  tvh_mutex_unlock(&atomic_lock);
   return ret;
 #endif
 }
@@ -184,7 +204,16 @@ atomic_dec_s64(volatile int64_t *ptr, int64_t decr)
 static inline int
 atomic_exchange(volatile int *ptr, int val)
 {
+#if ENABLE_ATOMIC32
   return  __sync_lock_test_and_set(ptr, val);
+#else
+  int ret;
+  tvh_mutex_lock(&atomic_lock);
+  ret = *ptr;
+  *ptr = val;
+  tvh_mutex_unlock(&atomic_lock);
+  return ret;
+#endif
 }
 
 static inline uint64_t
@@ -194,10 +223,10 @@ atomic_exchange_u64(volatile uint64_t *ptr, uint64_t val)
   return  __sync_lock_test_and_set(ptr, val);
 #else
   uint64_t ret;
-  pthread_mutex_lock(&atomic_lock);
+  tvh_mutex_lock(&atomic_lock);
   ret = *ptr;
   *ptr = val;
-  pthread_mutex_unlock(&atomic_lock);
+  tvh_mutex_unlock(&atomic_lock);
   return ret;
 #endif
 }
@@ -209,10 +238,10 @@ atomic_exchange_s64(volatile int64_t *ptr, int64_t val)
   return  __sync_lock_test_and_set(ptr, val);
 #else
   int64_t ret;
-  pthread_mutex_lock(&atomic_lock);
+  tvh_mutex_lock(&atomic_lock);
   ret = *ptr;
   *ptr = val;
-  pthread_mutex_unlock(&atomic_lock);
+  tvh_mutex_unlock(&atomic_lock);
   return ret;
 #endif
 }
@@ -224,10 +253,25 @@ atomic_exchange_time_t(volatile time_t *ptr, time_t val)
   return  __sync_lock_test_and_set(ptr, val);
 #else
   time_t ret;
-  pthread_mutex_lock(&atomic_lock);
+  tvh_mutex_lock(&atomic_lock);
   ret = *ptr;
   *ptr = val;
-  pthread_mutex_unlock(&atomic_lock);
+  tvh_mutex_unlock(&atomic_lock);
+  return ret;
+#endif
+}
+
+static inline void *
+atomic_exchange_ptr(atomic_refptr_t ptr, void *val)
+{
+#if ENABLE_ATOMIC_PTR
+  return  __sync_lock_test_and_set(ptr, val);
+#else
+  void *ret;
+  tvh_mutex_lock(&atomic_lock);
+  ret = *ptr;
+  *ptr = val;
+  tvh_mutex_unlock(&atomic_lock);
   return ret;
 #endif
 }
@@ -288,6 +332,12 @@ atomic_set_time_t(volatile time_t *ptr, time_t val)
   return atomic_exchange_time_t(ptr, val);
 }
 
+static inline void *
+atomic_set_ptr(atomic_refptr_t ptr, void *val)
+{
+  return atomic_exchange_ptr(ptr, val);
+}
+
 /*
  * Atomic set operation + peak (MAX)
  */
@@ -302,12 +352,12 @@ atomic_set_s64_peak(volatile int64_t *ptr, int64_t val, volatile int64_t *peak)
   return ret;
 #else
   int64_t ret;
-  pthread_mutex_lock(&atomic_lock);
+  tvh_mutex_lock(&atomic_lock);
   ret = *ptr;
   *ptr = val;
   if (val > *peak)
     *peak = val;
-  pthread_mutex_unlock(&atomic_lock);
+  tvh_mutex_unlock(&atomic_lock);
   return ret;
 #endif
 }

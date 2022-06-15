@@ -54,7 +54,7 @@ static const void *description_get(wizard_page_t *page, const char **doc)
     htsbuf_queue_init(&q, 0);
     for (; *doc; doc++) {
       if (*doc[0] == '\xff') {
-        htsbuf_append_str(&q, tvh_gettext_lang(config.language_ui, *doc + 1));
+        htsbuf_append_str(&q, tvh_gettext_lang(config.language_ui, *doc + 2));
       } else {
         htsbuf_append_str(&q, *doc);
       }
@@ -240,7 +240,7 @@ wizard_page_t *wizard_hello(const char *lang)
   };
   wizard_page_t *page =
     page_init("hello", "wizard_hello",
-    N_("Welcome - Tvheadend - your TV streaming server and video recorder"));
+    N_("Welcome"));
   idclass_t *ic = (idclass_t *)page->idnode.in_class;
   wizard_hello_t *w;
   htsmsg_t *m;
@@ -254,7 +254,7 @@ wizard_page_t *wizard_hello(const char *lang)
   page->aux = w = calloc(1, sizeof(wizard_hello_t));
 
   if (config.language_ui)
-    strncpy(w->ui_lang, config.language_ui, sizeof(w->ui_lang)-1);
+    strlcpy(w->ui_lang, config.language_ui, sizeof(w->ui_lang));
 
   m = htsmsg_csv_2_list(config.language, ',');
   f = m ? HTSMSG_FIRST(m) : NULL;
@@ -262,9 +262,9 @@ wizard_page_t *wizard_hello(const char *lang)
     s = htsmsg_field_get_string(f);
     if (s == NULL) break;
     switch (idx) {
-    case 0: strncpy(w->epg_lang1, s, sizeof(w->epg_lang1) - 1); break;
-    case 1: strncpy(w->epg_lang2, s, sizeof(w->epg_lang2) - 1); break;
-    case 2: strncpy(w->epg_lang3, s, sizeof(w->epg_lang3) - 1); break;
+    case 0: strlcpy(w->epg_lang1, s, sizeof(w->epg_lang1)); break;
+    case 1: strlcpy(w->epg_lang2, s, sizeof(w->epg_lang2)); break;
+    case 2: strlcpy(w->epg_lang3, s, sizeof(w->epg_lang3)); break;
     }
     f = HTSMSG_NEXT(f);
   }
@@ -464,7 +464,7 @@ wizard_page_t *wizard_login(const char *lang)
   };
   wizard_page_t *page =
     page_init("login", "wizard_login",
-    N_("Welcome - Tvheadend - your TV streaming server and video recorder"));
+    N_("Access Control"));
   idclass_t *ic = (idclass_t *)page->idnode.in_class;
   wizard_login_t *w;
   access_entry_t *ae;
@@ -667,7 +667,7 @@ wizard_page_t *wizard_network(const char *lang)
     PREV_BUTTON(login),
     NEXT_BUTTON(muxes),
   };
-  wizard_page_t *page = page_init("network", "wizard_network", N_("Network settings"));
+  wizard_page_t *page = page_init("network", "wizard_network", N_("Tuner and Network"));
   idclass_t *ic = (idclass_t *)page->idnode.in_class;
   wizard_network_t *w;
   mpegts_network_t *mn;
@@ -749,14 +749,18 @@ static void muxes_changed(idnode_t *in)
     mn = mpegts_network_find(w->networkid[idx]);
     if (mn == NULL || !mn->mn_wizard)
       continue;
+#if ENABLE_MPEGTS_DVB
     if (idnode_is_instance(&mn->mn_id, &dvb_network_class) && w->muxes[idx][0]) {
       dvb_network_scanfile_set((dvb_network_t *)mn, w->muxes[idx]);
     }
+#endif
 #if ENABLE_IPTV
-      else if (idnode_is_instance(&mn->mn_id, &iptv_auto_network_class) &&
+    if (idnode_is_instance(&mn->mn_id, &iptv_auto_network_class) &&
                w->iptv_url[idx][0]) {
       htsmsg_t *m = htsmsg_create_map();
       htsmsg_add_str(m, "url", w->iptv_url[idx]);
+      htsmsg_add_u32(m, "max_streams", 1);
+      htsmsg_add_bool(m, "bouquet", 1);
       idnode_load(&mn->mn_id, m);
       idnode_changed(&mn->mn_id);
       htsmsg_destroy(m);
@@ -769,7 +773,7 @@ static const void *muxes_progress_get(void *o)
 {
   wizard_page_t *p = o;
   wizard_muxes_t *w = p->aux;
-  snprintf(prop_sbuf, PROP_SBUF_LEN, "%s", tvh_gettext_lang(w->lang, N_("Scan progress")));
+  snprintf(prop_sbuf, PROP_SBUF_LEN, "%s", tvh_gettext_lang(w->lang, N_("Progress")));
   return &prop_sbuf_ptr;
 }
 
@@ -844,7 +848,18 @@ static int muxes_set_idvalue##num(void *o, const void *v) \
   wizard_muxes_t *w = p->aux; \
   snprintf(w->networkid[num-1], sizeof(w->networkid[num-1]), "%s", (const char *)v); \
   return 1; \
-} \
+}
+
+MUXES_FCN(1)
+MUXES_FCN(2)
+MUXES_FCN(3)
+MUXES_FCN(4)
+MUXES_FCN(5)
+MUXES_FCN(6)
+
+#if ENABLE_MPEGTS_DVB
+
+#define MUXES_FCN_DVB(num) \
 static const void *muxes_get_value##num(void *o) \
 { \
   wizard_page_t *p = o; \
@@ -869,12 +884,14 @@ static htsmsg_t *muxes_get_list##num(void *o, const char *lang) \
 }
 
 
-MUXES_FCN(1)
-MUXES_FCN(2)
-MUXES_FCN(3)
-MUXES_FCN(4)
-MUXES_FCN(5)
-MUXES_FCN(6)
+MUXES_FCN_DVB(1)
+MUXES_FCN_DVB(2)
+MUXES_FCN_DVB(3)
+MUXES_FCN_DVB(4)
+MUXES_FCN_DVB(5)
+MUXES_FCN_DVB(6)
+
+#endif
 
 #if ENABLE_IPTV
 
@@ -916,6 +933,7 @@ wizard_page_t *wizard_muxes(const char *lang)
     NETWORK_GROUP(6),
     {}
   };
+#if ENABLE_MPEGTS_DVB
   static const property_t nprops[] = {
     MUXES(1),
     MUXES(2),
@@ -924,6 +942,7 @@ wizard_page_t *wizard_muxes(const char *lang)
     MUXES(5),
     MUXES(6),
   };
+#endif
 #if ENABLE_IPTV
   static const property_t iptvprops[] = {
     MUXES_IPTV(1),
@@ -940,7 +959,7 @@ wizard_page_t *wizard_muxes(const char *lang)
     PREV_BUTTON(network),
     NEXT_BUTTON(status),
   };
-  wizard_page_t *page = page_init("muxes", "wizard_muxes", N_("Assign predefined muxes to networks"));
+  wizard_page_t *page = page_init("muxes", "wizard_muxes", N_("Predefined Muxes"));
   idclass_t *ic = (idclass_t *)page->idnode.in_class;
   wizard_muxes_t *w;
   mpegts_network_t *mn;
@@ -960,14 +979,16 @@ wizard_page_t *wizard_muxes(const char *lang)
     if (mn->mn_wizard) {
       mn->mn_display_name(mn, w->network[midx], sizeof(w->network[midx]));
       idnode_uuid_as_str(&mn->mn_id, w->networkid[midx]);
+#if ENABLE_MPEGTS_DVB
       if (idnode_is_instance(&mn->mn_id, &dvb_network_class)) {
         w->props[idx++] = nprops[midx * 3 + 0];
         w->props[idx++] = nprops[midx * 3 + 1];
         w->props[idx++] = nprops[midx * 3 + 2];
         midx++;
       }
+#endif
 #if ENABLE_IPTV
-        else if (idnode_is_instance(&mn->mn_id, &iptv_auto_network_class)) {
+      if (idnode_is_instance(&mn->mn_id, &iptv_auto_network_class)) {
         snprintf(w->iptv_url[midx], sizeof(w->iptv_url[midx]), "%s", ((iptv_network_t *)mn)->in_url ?: "");
         w->props[idx++] = iptvprops[midx * 3 + 0];
         w->props[idx++] = iptvprops[midx * 3 + 1];
@@ -1023,7 +1044,7 @@ wizard_page_t *wizard_status(const char *lang)
     NEXT_BUTTON(mapping),
     {}
   };
-  wizard_page_t *page = page_init("status", "wizard_status", N_("Scan status"));
+  wizard_page_t *page = page_init("status", "wizard_status", N_("Scanning"));
   idclass_t *ic = (idclass_t *)page->idnode.in_class;
   ic->ic_properties = props;
   ic->ic_groups = groups;
@@ -1115,7 +1136,7 @@ wizard_page_t *wizard_mapping(const char *lang)
     NEXT_BUTTON(channels),
     {}
   };
-  wizard_page_t *page = page_init("mapping", "wizard_mapping", N_("Service mapping"));
+  wizard_page_t *page = page_init("mapping", "wizard_mapping", N_("Service Mapping"));
   idclass_t *ic = (idclass_t *)page->idnode.in_class;
   wizard_mapping_t *w;
   ic->ic_properties = props;

@@ -29,6 +29,7 @@
 
 #include "htsmsg.h"
 #include "htsmsg_binary.h"
+#include "htsmsg_binary2.h"
 #include "htsmsg_json.h"
 #include "settings.h"
 #include "tvheadend.h"
@@ -100,7 +101,7 @@ _hts_settings_buildpath
   if (*tmp != '/' && prefix)
     snprintf(dst, dstsize, "%s/%s", prefix, tmp);
   else
-    strncpy(dst, tmp, dstsize);
+    strlcpy(dst, tmp, dstsize);
 
   while(*n) {
     if(*n == ':' || *n == '?' || *n == '*' || *n > 127 || *n < 32)
@@ -129,7 +130,7 @@ void
 hts_settings_save(htsmsg_t *record, const char *pathfmt, ...)
 {
   char path[PATH_MAX];
-  char tmppath[PATH_MAX];
+  char tmppath[PATH_MAX + 4];
   int fd;
   va_list ap;
   htsbuf_queue_t hq;
@@ -182,9 +183,9 @@ hts_settings_save(htsmsg_t *record, const char *pathfmt, ...)
 #if ENABLE_ZLIB
     void *msgdata = NULL;
     size_t msglen;
-    r = htsmsg_binary_serialize(record, &msgdata, &msglen, 2*1024*1024);
+    r = htsmsg_binary2_serialize0(record, &msgdata, &msglen, 2*1024*1024);
     if (!r && msglen >= 4) {
-      r = tvh_gzip_deflate_fd_header(fd, msgdata + 4, msglen - 4, NULL, 3);
+      r = tvh_gzip_deflate_fd_header(fd, msgdata, msglen, NULL, 3, "01");
       if (r)
         ok = 0;
     } else {
@@ -233,7 +234,8 @@ hts_settings_load_one(const char *filename)
 
   /* Decode */
   if(n == size) {
-    if (size > 12 && memcmp(mem, "\xff\xffGZIP00", 8) == 0) {
+    if (size > 12 && memcmp(mem, "\xff\xffGZIP0", 7) == 0 &&
+        (mem[7] == '0' || mem[7] == '1')) {
 #if ENABLE_ZLIB
       uint32_t orig = (mem[8] << 24) | (mem[9] << 16) | (mem[10] << 8) | mem[11];
       if (orig > 10*1024*1024U) {
@@ -242,7 +244,11 @@ hts_settings_load_one(const char *filename)
       } else if (orig > 0) {
         uint8_t *unpacked = tvh_gzip_inflate((uint8_t *)mem + 12, size - 12, orig);
         if (unpacked) {
-          r = htsmsg_binary_deserialize(unpacked, orig, NULL);
+          if (mem[7] == '1') {
+            r = htsmsg_binary2_deserialize0(unpacked, orig, NULL);
+          } else {
+            r = htsmsg_binary_deserialize0(unpacked, orig, NULL);
+          }
           free(unpacked);
         }
       }
@@ -266,6 +272,7 @@ static htsmsg_t *
 hts_settings_load_path(const char *fullpath, int depth)
 {
   char child[PATH_MAX];
+  const char *name;
   struct filebundle_stat st;
   fb_dirent **namelist, *d;
   htsmsg_t *r, *c;
@@ -285,7 +292,8 @@ hts_settings_load_path(const char *fullpath, int depth)
     r = htsmsg_create_map();
     for(i = 0; i < n; i++) {
       d = namelist[i];
-      if(d->name[0] != '.') {
+      name = d->name;
+      if(name[0] != '.' && name[0] && name[strlen(name)-1] != '~') {
 
         snprintf(child, sizeof(child), "%s/%s", fullpath, d->name);
         if(d->type == FB_DIR && depth > 0) {
@@ -393,10 +401,10 @@ hts_settings_remove(const char *pathfmt, ...)
  *
  */
 int
-hts_settings_open_file(int for_write, const char *pathfmt, ...)
+hts_settings_open_file(int flags, const char *pathfmt, ...)
 {
   char path[PATH_MAX];
-  int flags;
+  int _flags;
   va_list ap;
 
   /* Build path */
@@ -405,13 +413,16 @@ hts_settings_open_file(int for_write, const char *pathfmt, ...)
   va_end(ap);
 
   /* Create directories */
-  if (for_write)
+  if (flags & HTS_SETTINGS_OPEN_WRITE)
     if (hts_settings_makedirs(path)) return -1;
 
   /* Open file */
-  flags = for_write ? O_CREAT | O_TRUNC | O_WRONLY : O_RDONLY;
+  _flags = (flags & HTS_SETTINGS_OPEN_WRITE) ? O_CREAT | O_TRUNC | O_WRONLY : O_RDONLY;
 
-  return tvh_open(path, flags, S_IRUSR | S_IWUSR);
+  if (flags & HTS_SETTINGS_OPEN_DIRECT)
+    return open(path, _flags, S_IRUSR | S_IWUSR);
+
+  return tvh_open(path, _flags, S_IRUSR | S_IWUSR);
 }
 
 /*

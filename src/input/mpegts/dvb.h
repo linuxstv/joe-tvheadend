@@ -26,8 +26,12 @@
 #ifndef __TVH_DVB_SUPPORT_H__
 #define __TVH_DVB_SUPPORT_H__
 
+#include "queue.h"
+#include "redblack.h"
+
 struct mpegts_table;
 struct mpegts_table_state;
+struct mpegts_network;
 struct mpegts_mux;
 struct lang_str;
 
@@ -77,6 +81,9 @@ struct lang_str;
 
 #define DVB_TOT_BASE                  0x73
 #define DVB_TOT_MASK                  0xFF
+
+#define DVB_HBBTV_BASE                0x74
+#define DVB_HBBTV_MASK                0xFF
 
 #define DVB_FASTSCAN_NIT_BASE         0xBC
 #define DVB_FASTSCAN_SDT_BASE         0xBD
@@ -165,8 +172,22 @@ struct lang_str;
 
 #define DVB_DESC_BSKYB_NVOD           0xC0
 
+#define DVB_DESC_FREESAT_NIT          0xD2
 #define DVB_DESC_FREESAT_LCN          0xD3
 #define DVB_DESC_FREESAT_REGIONS      0xD4
+
+/* HBBTV */
+#define DVB_DESC_APP		      0x00
+#define DVB_DESC_APP_NAME             0x01
+#define DVB_DESC_APP_TRANSPORT        0x02
+#define DVB_DESC_APP_EXT_AUTH         0x05
+#define DVB_DESC_APP_REC	      0x06
+#define DVB_DESC_APP_ICONS            0x0B
+#define DVB_DESC_APP_STORAGE          0x10
+#define DVB_DESC_APP_GRAPHICS_CONSTR  0x14
+#define DVB_DESC_APP_SIMPLE_LOCATION  0x15
+#define DVB_DESC_APP_USAGE	      0x16
+#define DVB_DESC_APP_SIMPLE_BOUNDARY  0x17
 
 /* Descriptors defined in A/65:2009 */
 
@@ -210,7 +231,21 @@ struct lang_str *atsc_get_string
 
 /* Conversion */
 
-#define bcdtoint(i) ((((i & 0xf0) >> 4) * 10) + (i & 0x0f))
+static inline uint32_t bcdtoint(const uint32_t i) {
+  return ((((i & 0xf0) >> 4) * 10) + (i & 0x0f));
+}
+static inline uint32_t bcdtoint4(const uint8_t *ptr) {
+  return (bcdtoint(ptr[0]) * 1000000) +
+         (bcdtoint(ptr[1]) * 10000) +
+         (bcdtoint(ptr[2]) * 100) +
+         bcdtoint(ptr[3]);
+}
+static inline uint32_t bcdtoint41(const uint8_t *ptr) {
+  return (bcdtoint(ptr[0]) * 100000) +
+         (bcdtoint(ptr[1]) * 1000) +
+         (bcdtoint(ptr[2]) * 10) +
+         ((ptr[3]) >> 4);
+}
 
 htsmsg_t *dvb_timezone_enum(void *p, const char *lang);
 
@@ -228,7 +263,7 @@ do {\
   lptr = 2 + off + ptr;\
   ptr += 2 + off + llen;\
   len -= 2 + off + llen;\
-  if (len < 0) {tvhtrace(mt->mt_subsys, "%s: len < 0", mt->mt_name); return -1; }\
+  if (len < 0) {tvhtrace(mt->mt_subsys, "%s: len < 0", mt->mt_name);goto dvberr;}\
 } while(0)
 
 #define DVB_LOOP_EACH(ptr, len, min)\
@@ -239,13 +274,9 @@ do {\
   DVB_LOOP_EACH(lptr, llen, min)
 
 #define DVB_DESC_EACH(mt, ptr, len, dtag, dlen, dptr)\
-  DVB_LOOP_EACH(ptr, len, 2)\
-    if      (!(dtag  = ptr[0]))      {tvhtrace(mt->mt_subsys, "%s: 1", mt->mt_name);return -1;}\
-    else if ((dlen  = ptr[1]) < 0)   {tvhtrace(mt->mt_subsys, "%s: 2", mt->mt_name);return -1;}\
-    else if (!(dptr  = ptr+2))       {tvhtrace(mt->mt_subsys, "%s: 3", mt->mt_name);return -1;}\
-    else if ( (len -= 2 + dlen) < 0) {tvhtrace(mt->mt_subsys, "%s: 4", mt->mt_name);return -1;}\
-    else if (!(ptr += 2 + dlen))     {tvhtrace(mt->mt_subsys, "%s: 5", mt->mt_name);return -1;}\
-    else
+  DVB_LOOP_EACH(ptr, len, 2) { \
+    dtag = ptr[0], dlen = ptr[1], dptr = ptr+2, ptr += 2+dlen; \
+    if ((len -= 2+dlen) < 0) {tvhtrace(mt->mt_subsys, "%s: dlen < 0", mt->mt_name);goto dvberr;}\
 
 #define DVB_DESC_FOREACH(mt, ptr, len, off, lptr, llen, dtag, dlen, dptr)\
   DVB_LOOP_INIT(mt, ptr, len, off, lptr, llen);\
@@ -256,9 +287,12 @@ do {\
  */
 
 #define MPEGTS_PSI_SECTION_SIZE 5000
+#define MPEGTS_PSI_VERSION_NONE 255
 
 typedef struct mpegts_psi_section
 {
+  uint8_t ps_table;  // SI table ID
+  uint8_t ps_mask;   // mask
   int8_t  ps_cc;
   int8_t  ps_cco;
   int     ps_offset;
@@ -274,6 +308,7 @@ typedef struct mpegts_psi_table_state
   int      tableid;
   uint64_t extraid;
   int      version;
+  int      last;
   int      complete;
   int      working;
   uint32_t sections[8];
@@ -294,6 +329,7 @@ typedef struct mpegts_psi_table
 
   int     mt_pid;
 
+  time_t  mt_last_complete;
   int     mt_complete;
   int     mt_incomplete;
   uint8_t mt_finished;
@@ -318,7 +354,8 @@ int dvb_table_end
 int dvb_table_begin
   (mpegts_psi_table_t *mt, const uint8_t *ptr, int len,
    int tableid, uint64_t extraid, int minlen,
-   mpegts_psi_table_state_t **st, int *sect, int *last, int *ver);
+   mpegts_psi_table_state_t **st, int *sect, int *last, int *ver,
+   time_t interval);
 void dvb_table_reset (mpegts_psi_table_t *mt);
 void dvb_table_release (mpegts_psi_table_t *mt);
 
@@ -328,7 +365,11 @@ typedef void (*mpegts_psi_parse_callback_t)
   ( mpegts_psi_table_t *, const uint8_t *buf, int len );
 
 void dvb_table_parse_init
-  ( mpegts_psi_table_t *mt, const char *name, int subsys, int pid, void *opaque );
+  ( mpegts_psi_table_t *mt, const char *name, int subsys, int pid,
+    uint8_t table, uint8_t mask, void *opaque );
+
+void dvb_table_parse_reinit_input ( mpegts_psi_table_t *mt );
+void dvb_table_parse_reinit_output ( mpegts_psi_table_t *mt );
 
 void dvb_table_parse_done ( mpegts_psi_table_t *mt);
 
@@ -383,9 +424,11 @@ typedef enum dvb_fe_type {
   DVB_TYPE_S,			/* satellite */
   DVB_TYPE_ATSC_T,		/* terrestrial - north america */
   DVB_TYPE_ATSC_C,		/* cable - north america */
+  DVB_TYPE_CABLECARD, /* CableCARD - North America */
   DVB_TYPE_ISDB_T,              /* terrestrial - japan, brazil */
   DVB_TYPE_ISDB_C,              /* cable - japan, brazil */
   DVB_TYPE_ISDB_S,              /* satellite - japan, brazil */
+  DVB_TYPE_DTMB,                /* DTMB - china, cuba, hong kong, macau */
   DVB_TYPE_DAB,                 /* digital radio (europe) */
   DVB_TYPE_LAST = DVB_TYPE_DAB
 } dvb_fe_type_t;
@@ -576,6 +619,11 @@ typedef struct dvb_isdbt_config {
   } layers[3];
 } dvb_isdbt_config_t;
 
+typedef struct dvb_cablecard_config {
+  uint32_t  vchannel;
+  char     *name;
+} dvb_cablecard_config_t;
+
 typedef struct dvb_mux_conf
 {
   dvb_fe_type_t               dmc_fe_type;
@@ -588,11 +636,13 @@ typedef struct dvb_mux_conf
   int32_t                     dmc_fe_stream_id;
   dvb_fe_pls_mode_t           dmc_fe_pls_mode;
   uint32_t                    dmc_fe_pls_code;
+  uint32_t                    dmc_fe_data_slice;
   union {
     dvb_qpsk_config_t         dmc_fe_qpsk;
     dvb_qam_config_t          dmc_fe_qam;
     dvb_ofdm_config_t         dmc_fe_ofdm;
     dvb_isdbt_config_t        dmc_fe_isdbt;
+    dvb_cablecard_config_t    dmc_fe_cablecard;
   } u;
 
   // For scan file configurations
@@ -638,15 +688,16 @@ static inline int dvb_bandwidth( dvb_fe_bandwidth_t bw )
   return bw < 1000 ? 0 : bw * 1000;
 }
 
-int dvb_delsys2type ( enum dvb_fe_delivery_system ds );
+int dvb_delsys2type ( struct mpegts_network *ln, enum dvb_fe_delivery_system ds );
 
-void dvb_mux_conf_init ( dvb_mux_conf_t *dmc, dvb_fe_delivery_system_t delsys );
+void dvb_mux_conf_init ( struct mpegts_network *ln, dvb_mux_conf_t *dmc,
+                         dvb_fe_delivery_system_t delsys );
 
 int dvb_mux_conf_str ( dvb_mux_conf_t *conf, char *buf, size_t bufsize );
 
 const char *dvb_sat_position_to_str( int position, char *buf, size_t buflen );
 
-const int dvb_sat_position_from_str( const char *buf );
+int dvb_sat_position_from_str( const char *buf );
 
 static inline int dvb_modulation_is_none_or_auto ( int modulation )
 {
@@ -654,6 +705,8 @@ static inline int dvb_modulation_is_none_or_auto ( int modulation )
          modulation == DVB_MOD_AUTO ||
          modulation == DVB_MOD_QAM_AUTO;
 }
+
+uint32_t dvb_sat_pls( dvb_mux_conf_t *dmc );
 
 #endif /* ENABLE_MPEGTS_DVB */
 

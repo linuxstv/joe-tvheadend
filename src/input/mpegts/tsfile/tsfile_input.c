@@ -52,7 +52,7 @@ tsfile_input_thread ( void *aux )
   tsfile_mux_instance_t *tmi;
 
   /* Open file */
-  pthread_mutex_lock(&global_lock);
+  tvh_mutex_lock(&global_lock);
 
   if ((mmi = LIST_FIRST(&mi->mi_mux_active))) {
     tmi = (tsfile_mux_instance_t*)mmi;
@@ -63,15 +63,12 @@ tsfile_input_thread ( void *aux )
     else
       tvhtrace(LS_TSFILE, "adapter %d opened %s", mi->mi_instance, tmi->mmi_tsfile_path);
   }
-  pthread_mutex_unlock(&global_lock);
+  tvh_mutex_unlock(&global_lock);
   if (fd == -1) return NULL;
   
   /* Polling */
-  memset(&ev, 0, sizeof(ev));
   efd = tvhpoll_create(2);
-  ev.events          = TVHPOLL_IN;
-  ev.fd = ev.data.fd = mi->ti_thread_pipe.rd;
-  tvhpoll_add(efd, &ev, 1);
+  tvhpoll_add1(efd, mi->ti_thread_pipe.rd, TVHPOLL_IN, NULL);
 
   /* Alloc memory */
   sbuf_init_fixed(&buf, 18800);
@@ -97,12 +94,12 @@ tsfile_input_thread ( void *aux )
     /* Find PCR PID */
     if (tmi->mmi_tsfile_pcr_pid == MPEGTS_PID_NONE) { 
       mpegts_service_t *s;
-      pthread_mutex_lock(&tsfile_lock);
+      tvh_mutex_lock(&tsfile_lock);
       LIST_FOREACH(s, &tmi->mmi_mux->mm_services, s_dvb_mux_link) {
-        if (s->s_pcr_pid)
-          tmi->mmi_tsfile_pcr_pid = s->s_pcr_pid;
+        if (s->s_components.set_pcr_pid)
+          tmi->mmi_tsfile_pcr_pid = s->s_components.set_pcr_pid;
       }
-      pthread_mutex_unlock(&tsfile_lock);
+      tvh_mutex_unlock(&tsfile_lock);
     }
     
     /* Check for terminate */
@@ -134,7 +131,7 @@ tsfile_input_thread ( void *aux )
       pcr.pcr_first = PTS_UNSET;
       pcr.pcr_last  = PTS_UNSET;
       pcr.pcr_pid   = tmi->mmi_tsfile_pcr_pid;
-      mpegts_input_recv_packets((mpegts_input_t*)mi, mmi, &buf, 0, &pcr);
+      mpegts_input_recv_packets(mmi, &buf, 0, &pcr);
       if (pcr.pcr_pid)
         tmi->mmi_tsfile_pcr_pid = pcr.pcr_pid;
 
@@ -222,7 +219,7 @@ tsfile_input_start_mux ( mpegts_input_t *mi, mpegts_mux_instance_t *t, int weigh
       return SM_CODE_TUNING_FAILED;
     }
     tvhtrace(LS_TSFILE, "adapter %d starting thread", mi->mi_instance);
-    tvhthread_create(&ti->ti_thread_id, NULL, tsfile_input_thread, mi, "tsfile");
+    tvh_thread_create(&ti->ti_thread_id, NULL, tsfile_input_thread, mi, "tsfile");
   }
 
   /* Current */

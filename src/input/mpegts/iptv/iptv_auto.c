@@ -22,6 +22,7 @@
 #include "iptv_private.h"
 #include "channels.h"
 #include "download.h"
+#include "epggrab.h"
 #include "misc/m3u.h"
 
 #include <fcntl.h>
@@ -36,7 +37,7 @@ typedef struct auto_private {
 /*
  *
  */
-static int _epgcfg_from_str(const char *str)
+static int _epgcfg_from_str(const char *str, char *manual, size_t manual_len)
 {
   static struct strtab cfgs[] = {
     { "0",                 MM_EPG_DISABLE },
@@ -48,18 +49,19 @@ static int _epgcfg_from_str(const char *str)
     { "enable",            MM_EPG_ENABLE },
     { "on",                MM_EPG_ENABLE },
     { "force",             MM_EPG_FORCE },
-    { "eit",               MM_EPG_ONLY_EIT },
-    { "uk_freesat",        MM_EPG_ONLY_UK_FREESAT },
-    { "uk_freeview",       MM_EPG_ONLY_UK_FREEVIEW },
-    { "viasat_baltic",     MM_EPG_ONLY_VIASAT_BALTIC },
-    { "opentv_sky_uk",     MM_EPG_ONLY_OPENTV_SKY_UK },
-    { "opentv_sky_italia", MM_EPG_ONLY_OPENTV_SKY_ITALIA },
-    { "opentv_sky_ausat",  MM_EPG_ONLY_OPENTV_SKY_AUSAT },
-    { "bulsatcom_39e",     MM_EPG_ONLY_BULSATCOM_39E },
-    { "psip",              MM_EPG_ONLY_PSIP },
     { NULL }
   };
-  return str ? str2val(str, cfgs) : -1;
+  int r = str ? str2val(str, cfgs) : -1;
+  if (manual) *manual = '\0';
+  if (r < 0) {
+    const char *s = epggrab_ota_check_module_id(str);
+    if (s) {
+      r = MM_EPG_MANUAL;
+      if (manual)
+        strlcpy(manual, s, manual_len);
+    }
+  }
+  return r;
 }
 
 /*
@@ -69,6 +71,8 @@ static void
 iptv_auto_network_process_m3u_item(iptv_network_t *in,
                                    const char *last_url,
                                    const http_arg_list_t *remove_args,
+                                   const http_arg_list_t *ignore_args,
+                                   int ignore_path,
                                    int64_t chnum, htsmsg_t *item,
                                    int *total, int *count)
 {
@@ -76,15 +80,15 @@ iptv_auto_network_process_m3u_item(iptv_network_t *in,
   htsmsg_field_t *f;
   mpegts_mux_t *mm;
   iptv_mux_t *im;
-  url_t u;
-  int change, epgcfg;
+  url_t u, u2;
+  int change, epgcfg, muxprio, smuxprio;
   http_arg_list_t args;
   http_arg_t *ra1, *ra2, *ra2_next;
-  htsbuf_queue_t q;
   size_t l;
-  int64_t chnum2;
-  const char *url, *name, *logo, *epgid, *tags;
-  char url2[512], custom[512], name2[128], buf[32], *n;
+  int64_t chnum2, vlcprog;
+  const char *url, *url2, *name, *logo, *epgid, *tags;
+  char *s;
+  char custom[512], name2[128], buf[32], *moduleid, *n;
 
   url = htsmsg_get_str(item, "m3u-url");
 
@@ -100,7 +104,12 @@ iptv_auto_network_process_m3u_item(iptv_network_t *in,
     return;
 
   epgid = htsmsg_get_str(item, "tvh-chnum");
-  chnum2 = epgid ? prop_intsplit_from_str(epgid, CHANNEL_SPLIT) : 0;
+  if (!epgid) epgid = htsmsg_get_str(item, "tvg-chno");
+  chnum2 = epgid ? channel_get_number_from_str(epgid) : 0;
+
+  muxprio = htsmsg_get_s32_or_default(item, "tvh-prio", -1);
+  smuxprio = htsmsg_get_s32_or_default(item, "tvh-sprio", -1);
+
   if (chnum2 > 0) {
     chnum += chnum2;
   } else if (chnum) {
@@ -119,11 +128,12 @@ iptv_auto_network_process_m3u_item(iptv_network_t *in,
     logo = htsmsg_get_str(item, "logo");
 
   epgid = htsmsg_get_str(item, "tvg-id");
-  epgcfg = _epgcfg_from_str(htsmsg_get_str(item, "tvh-epg"));
+  moduleid = alloca(64);
+  epgcfg = _epgcfg_from_str(htsmsg_get_str(item, "tvh-epg"), moduleid, 64);
   tags = htsmsg_get_str(item, "tvh-tags");
   if (!tags) tags = htsmsg_get_str(item, "group-title");
   if (tags) {
-    tags = n = strdupa(tags);
+    tags = n = tvh_strdupa(tags);
     while (*n) {
       if (*n == '|')
         *n = '\n';
@@ -132,6 +142,8 @@ iptv_auto_network_process_m3u_item(iptv_network_t *in,
   }
 
   urlinit(&u);
+  urlinit(&u2);
+  url2 = url;
   custom[0] = '\0';
 
   if (strncmp(url, "pipe://", 7) == 0)
@@ -164,35 +176,37 @@ iptv_auto_network_process_m3u_item(iptv_network_t *in,
           http_arg_remove(&args, ra2);
       }
     free(u.query);
-    u.query = NULL;
-    if (!http_args_empty(&args)) {
-      htsbuf_queue_init(&q, 0);
-      TAILQ_FOREACH(ra1, &args, link) {
-        if (!htsbuf_empty(&q))
-          htsbuf_append(&q, "&", 1);
-        htsbuf_append_str(&q, ra1->key);
-        if (ra1->val) {
-          htsbuf_append(&q, "=", 1);
-          htsbuf_append_str(&q, ra1->val);
-        }
-      }
-      free(u.query);
-      u.query = htsbuf_to_string(&q);
-      htsbuf_queue_flush(&q);
-    }
+    u.query = http_arg_get_query(&args);
     http_arg_flush(&args);
-    l = 0;
-    tvh_strlcatf(url2, sizeof(url2), l, "%s://", u.scheme);
-    if (u.user && u.user[0] && u.pass && u.pass[0])
-      tvh_strlcatf(url2, sizeof(url2), l, "%s:%s@", u.user, u.pass);
-    tvh_strlcatf(url2, sizeof(url2), l, "%s", u.host);
-    if (u.port > 0)
-      tvh_strlcatf(url2, sizeof(url2), l, ":%d", u.port);
-    if (u.path)
-      tvh_strlcatf(url2, sizeof(url2), l, "%s", u.path);
-    if (u.query)
-      tvh_strlcatf(url2, sizeof(url2), l, "?%s", u.query);
-    url = url2;
+    if (!urlrecompose(&u))
+      url = url2 = u.raw;
+  }
+
+  /* remove requested arguments to ignore */
+  if (!http_args_empty(ignore_args) || ignore_path > 0) {
+    urlcopy(&u2, &u);
+    if (!http_args_empty(ignore_args)) {
+      http_arg_init(&args);
+      http_parse_args(&args, u2.query);
+      TAILQ_FOREACH(ra1, ignore_args, link)
+        for (ra2 = TAILQ_FIRST(&args); ra2; ra2 = ra2_next) {
+          ra2_next = TAILQ_NEXT(ra2, link);
+          if (strcmp(ra1->key, ra2->key) == 0)
+            http_arg_remove(&args, ra2);
+        }
+      free(u2.query);
+      u2.query = http_arg_get_query(&args);
+      http_arg_flush(&args);
+    }
+    if (ignore_path > 0 && u2.path) {
+      for (; ignore_path > 0; ignore_path--) {
+        s = strrchr(u2.path, '/');
+        if (s)
+          *s = '\0';
+      }
+    }
+    if (!urlrecompose(&u2))
+      url2 = u2.raw;
   }
 
 skip_url:
@@ -207,15 +221,16 @@ skip_url:
 
   LIST_FOREACH(mm, &in->mn_muxes, mm_network_link) {
     im = (iptv_mux_t *)mm;
-    if (strcmp(im->mm_iptv_url ?: "", url) == 0) {
+    if (strcmp(im->mm_iptv_url_cmpid ?: (im->mm_iptv_url ?: ""), url2) == 0) {
       im->im_delete_flag = 0;
+      change = 0;
       if (strcmp(im->mm_iptv_svcname ?: "", name)) {
         free(im->mm_iptv_svcname);
         im->mm_iptv_svcname = strdup(name);
         change = 1;
       }
       if (im->mm_iptv_chnum != chnum) {
-        iptv_bouquet_trigger(in, 0); /* propagate LCN change */
+        mpegts_network_bouquet_trigger((mpegts_network_t *)in, 0); /* propagate LCN change */
         im->mm_iptv_chnum = chnum;
         change = 1;
       }
@@ -248,6 +263,19 @@ skip_url:
         im->mm_epg = epgcfg;
         change = 1;
       }
+      if (moduleid[0] && strcmp(im->mm_epg_module_id ?: "", moduleid)) {
+        free(im->mm_epg_module_id);
+        im->mm_epg_module_id = strdup(moduleid);
+        change = 1;
+      }
+      if (muxprio >= 0 && im->mm_iptv_priority != muxprio) {
+        im->mm_iptv_priority = muxprio;
+        change = 1;
+      }
+      if (smuxprio >= 0 && im->mm_iptv_streaming_priority != smuxprio) {
+        im->mm_iptv_streaming_priority = smuxprio;
+        change = 1;
+      }
       if (change)
         idnode_notify_changed(&im->mm_id);
       (*total)++;
@@ -258,6 +286,7 @@ skip_url:
 
   conf = htsmsg_create_map();
   htsmsg_add_str(conf, "iptv_url", url);
+  htsmsg_add_str(conf, "iptv_url_cmpid", url2);
   if (n)
     htsmsg_add_str(conf, "iptv_muxname", n);
   if (name)
@@ -279,9 +308,20 @@ skip_url:
     htsmsg_add_str(conf, "iptv_hdr", custom);
   if (epgcfg >= 0)
     htsmsg_add_s32(conf, "epg", epgcfg);
+  if (moduleid[0])
+    htsmsg_add_str(conf, "epg_module_id", moduleid);
   if (in->in_tsid_accept_zero_value)
     htsmsg_add_s32(conf, "tsid_zero", 1);
+  if (!htsmsg_get_s64(item, "vlc-program", &vlcprog) &&
+      vlcprog > 1 && vlcprog < 8191)
+    htsmsg_add_s32(conf, "sid_filter", vlcprog);
+  if (muxprio >= 0)
+    htsmsg_add_s32(conf, "priority", muxprio);
+  if (smuxprio >= 0)
+    htsmsg_add_s32(conf, "spriority", smuxprio);
+
   im = iptv_mux_create0(in, NULL, conf);
+  mpegts_mux_post_create((mpegts_mux_t *)im);
   htsmsg_destroy(conf);
 
   if (im) {
@@ -291,6 +331,8 @@ skip_url:
   }
 
 end:
+  if (u.raw != u2.raw)
+    urlreset(&u2);
   urlreset(&u);
 }
 
@@ -302,6 +344,8 @@ iptv_auto_network_process_m3u(iptv_network_t *in, char *data,
                               const char *last_url,
                               const char *host_url,
                               http_arg_list_t *remove_args,
+                              http_arg_list_t *ignore_args,
+                              int ignore_path,
                               int64_t chnum)
 {
   int total = 0, count = 0;
@@ -311,13 +355,14 @@ iptv_auto_network_process_m3u(iptv_network_t *in, char *data,
 
   m = parse_m3u(data, in->in_ctx_charset, host_url);
   items = htsmsg_get_list(m, "items");
-  HTSMSG_FOREACH(f, items) {
-    if ((item = htsmsg_field_get_map(f)) == NULL) continue;
-    iptv_auto_network_process_m3u_item(in, last_url,
-                                       remove_args, chnum,
-                                       item,
-                                       &total, &count);
-    
+  if (items) {
+    HTSMSG_FOREACH(f, items) {
+      if ((item = htsmsg_field_get_map(f)) == NULL) continue;
+      iptv_auto_network_process_m3u_item(in, last_url,
+                                         remove_args, ignore_args, ignore_path,
+                                         chnum, item, &total, &count);
+      
+    }
   }
   htsmsg_destroy(m);
   if (total == 0)
@@ -339,8 +384,8 @@ iptv_auto_network_process(void *aux, const char *last_url,
   iptv_network_t *in = ap->in_network;
   mpegts_mux_t *mm, *mm2;
   int r = -1, count, n, i;
-  http_arg_list_t remove_args;
-  char *argv[10];
+  http_arg_list_t remove_args, ignore_args;
+  char *argv[32];
 
   /* note that we know that data are terminated with '\0' */
 
@@ -348,10 +393,17 @@ iptv_auto_network_process(void *aux, const char *last_url,
     return -1;
 
   http_arg_init(&remove_args);
-  if (in->in_remove_args && in->in_remove_args) {
+  if (in->in_remove_args) {
     n = http_tokenize(in->in_remove_args, argv, ARRAY_SIZE(argv), -1);
     for (i = 0; i < n; i++)
-      http_arg_set(&remove_args, argv[i], "1");
+      http_arg_set(&remove_args, argv[i], NULL);
+  }
+
+  http_arg_init(&ignore_args);
+  if (in->in_ignore_args) {
+    n = http_tokenize(in->in_ignore_args, argv, ARRAY_SIZE(argv), -1);
+    for (i = 0; i < n; i++)
+      http_arg_set(&ignore_args, argv[i], NULL);
   }
 
   LIST_FOREACH(mm, &in->mn_muxes, mm_network_link)
@@ -361,7 +413,9 @@ iptv_auto_network_process(void *aux, const char *last_url,
 
   if (!strncmp(data, "#EXTM3U", 7))
     r = iptv_auto_network_process_m3u(in, data, last_url, host_url,
-                                      &remove_args, in->in_channel_number);
+                                      &remove_args, &ignore_args,
+                                      in->in_ignore_path,
+                                      in->in_channel_number);
 
   http_arg_flush(&remove_args);
 
@@ -404,7 +458,8 @@ iptv_auto_network_trigger0(void *aux)
   auto_private_t *ap = aux;
   iptv_network_t *in = ap->in_network;
 
-  download_start(&ap->in_download, in->in_url, ap);
+  if (in->mn_enabled)
+    download_start(&ap->in_download, in->in_url, ap);
   mtimer_arm_rel(&ap->in_auto_timer, iptv_auto_network_trigger0, ap,
                  sec2mono(MAX(1, in->in_refetch_period) * 60));
 }

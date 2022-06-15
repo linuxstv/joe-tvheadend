@@ -16,17 +16,7 @@
  *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <pthread.h>
 #include <ctype.h>
-#include <assert.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdarg.h>
-#include <errno.h>
-#include <math.h>
-#include <time.h>
 
 #include "tvheadend.h"
 #include "settings.h"
@@ -88,14 +78,13 @@ dvr_timerec_purge_spawn(dvr_timerec_entry_t *dte, int delconf)
 static const char *
 dvr_timerec_title(dvr_timerec_entry_t *dte, struct tm *start)
 {
-  static char buf[256];
   size_t len;
 
   if (dte->dte_title == NULL)
     return _("Unknown");
-  len = strftime(buf, sizeof(buf) - 1, dte->dte_title, start);
-  buf[len] = '\0';
-  return buf;
+  len = strftime(prop_sbuf, PROP_SBUF_LEN-1, dte->dte_title, start);
+  prop_sbuf[len] = '\0';
+  return prop_sbuf;
 }
 
 /**
@@ -109,7 +98,7 @@ dvr_timerec_check(dvr_timerec_entry_t *dte)
   struct tm tm_start, tm_stop;
   const char *title;
   char buf[200];
-  char ubuf[UUID_HEX_SIZE];
+  htsmsg_t *conf;
 
   if(dte->dte_enabled == 0 || dte->dte_weekdays == 0)
     goto fail;
@@ -153,13 +142,23 @@ dvr_timerec_check(dvr_timerec_entry_t *dte)
   snprintf(buf, sizeof(buf), _("Time recording%s%s"),
            dte->dte_comment ? ": " : "",
            dte->dte_comment ?: "");
-  de = dvr_entry_create_(1, idnode_uuid_as_str(&dte->dte_config->dvr_id, ubuf),
-                         NULL, dte->dte_channel,
-                         start, stop, 0, 0, title, NULL,
-                         NULL, NULL, NULL, dte->dte_owner, dte->dte_creator,
-                         NULL, dte, dte->dte_pri, dte->dte_retention,
-                         dte->dte_removal, buf);
 
+  conf = htsmsg_create_map();
+  htsmsg_add_uuid(conf, "config_name", &dte->dte_config->dvr_id.in_uuid);
+  htsmsg_set_uuid(conf, "channel", &dte->dte_channel->ch_id.in_uuid);
+  lang_str_serialize_one(conf, "title", title, NULL);
+  htsmsg_add_s64(conf, "start", start);
+  htsmsg_add_s64(conf, "stop", stop);
+  htsmsg_add_u32(conf, "pri", dte->dte_pri);
+  htsmsg_add_u32(conf, "retention", dte->dte_retention);
+  htsmsg_add_u32(conf, "removal", dte->dte_removal);
+  htsmsg_add_str2(conf, "owner", dte->dte_owner);
+  htsmsg_add_str2(conf, "creator", dte->dte_creator);
+  htsmsg_add_str(conf, "comment", buf);
+  htsmsg_add_uuid(conf, "timerec", &dte->dte_id.in_uuid);
+  htsmsg_add_str2(conf, "directory", dte->dte_directory);
+  dvr_entry_create_from_htsmsg(conf, NULL);
+  htsmsg_destroy(conf);
   return;
 
 fail:
@@ -185,7 +184,7 @@ dvr_timerec_create(const char *uuid, htsmsg_t *conf)
 
   dte->dte_title = strdup("Time-%F_%R");
   dte->dte_weekdays = 0x7f;
-  dte->dte_pri = DVR_PRIO_NORMAL;
+  dte->dte_pri = DVR_PRIO_DEFAULT;
   dte->dte_start = -1;
   dte->dte_stop = -1;
   dte->dte_enabled = 1;
@@ -279,7 +278,8 @@ dvr_timerec_entry_class_save(idnode_t *self, char *filename, size_t fsize)
   htsmsg_t *m = htsmsg_create_map();
   char ubuf[UUID_HEX_SIZE];
   idnode_save(&dte->dte_id, m);
-  snprintf(filename, fsize, "dvr/timerec/%s", idnode_uuid_as_str(&dte->dte_id, ubuf));
+  if (filename)
+    snprintf(filename, fsize, "dvr/timerec/%s", idnode_uuid_as_str(&dte->dte_id, ubuf));
   return m;
 }
 
@@ -303,8 +303,9 @@ dvr_timerec_entry_class_perm(idnode_t *self, access_t *a, htsmsg_t *msg_to_write
   return 0;
 }
 
-static const char *
-dvr_timerec_entry_class_get_title (idnode_t *self, const char *lang)
+static void
+dvr_timerec_entry_class_get_title
+  (idnode_t *self, const char *lang, char *dst, size_t dstsize)
 {
   dvr_timerec_entry_t *dte = (dvr_timerec_entry_t *)self;
   const char *s = "";
@@ -312,7 +313,7 @@ dvr_timerec_entry_class_get_title (idnode_t *self, const char *lang)
     s = dte->dte_name;
   else if (dte->dte_comment && dte->dte_comment[0] != '\0')
     s = dte->dte_comment;
-  return s;
+  snprintf(dst, dstsize, "%s", s);
 }
 
 static int
@@ -356,7 +357,7 @@ dvr_timerec_entry_class_channel_rend(void *o, const char *lang)
 {
   dvr_timerec_entry_t *dte = (dvr_timerec_entry_t *)o;
   if (dte->dte_channel)
-    return strdup(channel_get_name(dte->dte_channel));
+    return strdup(channel_get_name(dte->dte_channel, tvh_gettext_lang(lang, channel_blank_name)));
   return NULL;
 }
 
@@ -400,14 +401,11 @@ dvr_timerec_entry_class_stop_set(void *o, const void *v)
 static const void *
 dvr_timerec_entry_class_time_get(void *o, int tm)
 {
-  static const char *ret;
-  static char buf[16];
   if (tm >= 0)
-    snprintf(buf, sizeof(buf), "%02d:%02d", tm / 60, tm % 60);
+    snprintf(prop_sbuf, PROP_SBUF_LEN, "%02d:%02d", tm / 60, tm % 60);
   else
-    strncpy(buf, N_("Any"), 16);
-  ret = buf;
-  return &ret;
+    strlcpy(prop_sbuf, N_("Any"), PROP_SBUF_LEN);
+  return &prop_sbuf_ptr;
 }
 
 static const void *
@@ -509,7 +507,7 @@ dvr_timerec_entry_class_weekdays_rend(void *o, const char *lang)
 }
 
 static uint32_t
-dvr_timerec_entry_class_owner_opts(void *o)
+dvr_timerec_entry_class_owner_opts(void *o, uint32_t opts)
 {
   dvr_timerec_entry_t *dte = (dvr_timerec_entry_t *)o;
   if (dte && dte->dte_id.in_access &&
@@ -617,9 +615,12 @@ const idclass_t dvr_timerec_entry_class = {
       .type     = PT_U32,
       .id       = "pri",
       .name     = N_("Priority"),
-      .desc     = N_("Priority of the entry, higher-priority entries will take precedence and cancel lower-priority events."),
+      .desc     = N_("Priority of the recording. Higher priority entries "
+                     "will take precedence and cancel lower-priority events. "
+                     "The 'Not Set' value inherits the settings from "
+                     "the assigned DVR configuration."),
       .list     = dvr_entry_class_pri_list,
-      .def.i    = DVR_PRIO_NORMAL,
+      .def.i    = DVR_PRIO_DEFAULT,
       .off      = offsetof(dvr_timerec_entry_t, dte_pri),
       .opts     = PO_SORTKEY | PO_ADVANCED | PO_DOC_NLIST,
     },
@@ -698,7 +699,7 @@ dvr_timerec_init(void)
     HTSMSG_FOREACH(f, l) {
       if((c = htsmsg_get_map_by_field(f)) == NULL)
         continue;
-      (void)dvr_timerec_create(f->hmf_name, c);
+      (void)dvr_timerec_create(htsmsg_field_name(f), c);
     }
     htsmsg_destroy(l);
   }
@@ -709,10 +710,10 @@ dvr_timerec_done(void)
 {
   dvr_timerec_entry_t *dte;
 
-  pthread_mutex_lock(&global_lock);
+  tvh_mutex_lock(&global_lock);
   while ((dte = TAILQ_FIRST(&timerec_entries)) != NULL)
     timerec_entry_destroy(dte, 0);
-  pthread_mutex_unlock(&global_lock);
+  tvh_mutex_unlock(&global_lock);
 }
 
 static void

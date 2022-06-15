@@ -20,9 +20,11 @@
 #define HTTP_H_
 
 #include "htsbuf.h"
+#include "htsmsg.h"
 #include "url.h"
 #include "tvhpoll.h"
-  #include "access.h"
+#include "access.h"
+#include "atomic.h"
 
 struct channel;
 struct http_path;
@@ -86,6 +88,14 @@ typedef struct http_arg {
 #define HTTP_STATUS_HTTP_VERSION    505
 #define HTTP_STATUS_OP_NOT_SUPPRT   551
 
+#define HTTP_AUTH_PLAIN             0
+#define HTTP_AUTH_DIGEST            1
+#define HTTP_AUTH_PLAIN_DIGEST      2
+
+#define HTTP_AUTH_ALGO_MD5          0
+#define HTTP_AUTH_ALGO_SHA256       1
+#define HTTP_AUTH_ALGO_SHA512_256   2
+
 typedef enum http_state {
   HTTP_CON_WAIT_REQUEST,
   HTTP_CON_READ_HEADER,
@@ -121,23 +131,36 @@ typedef enum http_ver {
   RTSP_VERSION_1_0,
 } http_ver_t;
 
+typedef enum http_wsop {
+  HTTP_WSOP_TEXT = 0,
+  HTTP_WSOP_BINARY = 1,
+  HTTP_WSOP_PING = 2,
+  HTTP_WSOP_PONG = 3
+} http_wsop_t;
+
 typedef struct http_connection {
-  pthread_mutex_t hc_fd_lock;
+  int hc_subsys;
   int hc_fd;
   struct sockaddr_storage *hc_peer;
   char *hc_peer_ipstr;
   struct sockaddr_storage *hc_self;
   char *hc_representative;
+  struct sockaddr_storage *hc_proxy_ip;
+  struct sockaddr_storage *hc_local_ip;
 
-  pthread_mutex_t  *hc_paths_mutex;
+  tvh_mutex_t *hc_paths_mutex;
   http_path_list_t *hc_paths;
   int (*hc_process)(struct http_connection *hc, htsbuf_queue_t *spill);
 
   char *hc_url;
   char *hc_url_orig;
-  int hc_keep_alive;
 
   htsbuf_queue_t  hc_reply;
+
+  int             hc_extra_insend;
+  tvh_mutex_t     hc_extra_lock;
+  int             hc_extra_chunks;
+  htsbuf_queue_t  hc_extra;
 
   http_arg_list_t hc_args;
 
@@ -152,13 +175,24 @@ typedef struct http_connection {
   char *hc_authhdr;
   char *hc_nonce;
   access_t *hc_access;
+  enum {
+    HC_AUTH_NONE,
+    HC_AUTH_ADDR,
+    HC_AUTH_PLAIN,
+    HC_AUTH_DIGEST,
+    HC_AUTH_TICKET,
+    HC_AUTH_PERM
+  } hc_auth_type;
 
-  struct config_head *hc_user_config;
-
-  int hc_no_output;
-  int hc_shutdown;
+  /* RTSP */
   uint64_t hc_cseq;
   char *hc_session;
+
+  /* Flags */
+  uint8_t hc_keep_alive;
+  uint8_t hc_no_output;
+  uint8_t hc_shutdown;
+  uint8_t hc_is_local_ip;   /*< a connection from the local network */
 
   /* Support for HTTP POST */
   
@@ -174,26 +208,36 @@ int http_str2cmd(const char *str);
 const char *http_ver2str(int val);
 int http_str2ver(const char *str);
 
-static inline void http_arg_init(struct http_arg_list *list)
+static inline void http_arg_init(http_arg_list_t *list)
 {
   TAILQ_INIT(list);
 }
 
-void http_arg_remove(struct http_arg_list *list, struct http_arg *arg);
-void http_arg_flush(struct http_arg_list *list);
+void http_arg_remove(http_arg_list_t *list, struct http_arg *arg);
+void http_arg_flush(http_arg_list_t *list);
 
-char *http_arg_get(struct http_arg_list *list, const char *name);
-char *http_arg_get_remove(struct http_arg_list *list, const char *name);
+char *http_arg_get(http_arg_list_t *list, const char *name);
+char *http_arg_get_remove(http_arg_list_t *list, const char *name);
 
-void http_arg_set(struct http_arg_list *list, const char *key, const char *val);
+void http_arg_set(http_arg_list_t *list, const char *key, const char *val);
 
-static inline int http_args_empty(const struct http_arg_list *list) { return TAILQ_EMPTY(list); }
+char *http_arg_get_query(http_arg_list_t *list);
+
+static inline int http_args_empty(const http_arg_list_t *list) { return TAILQ_EMPTY(list); }
 
 int http_tokenize(char *buf, char **vec, int vecsize, int delimiter);
+
+const char * http_username(http_connection_t *hc);
+
+int http_noaccess_code(http_connection_t *hc);
+
+void http_alive(http_connection_t *hc);
 
 void http_error(http_connection_t *hc, int error);
 
 int http_encoding_valid(http_connection_t *hc, const char *encoding);
+
+int http_header_match(http_connection_t *hc, const char *name, const char *value);
 
 void http_output_html(http_connection_t *hc);
 
@@ -204,14 +248,50 @@ void http_redirect(http_connection_t *hc, const char *location,
 
 void http_css_import(http_connection_t *hc, const char *location);
 
+void http_extra_destroy(http_connection_t *hc);
+
+int http_extra_flush(http_connection_t *hc);
+
+int http_extra_flush_partial(http_connection_t *hc);
+
+int http_extra_send(http_connection_t *hc, const void *data,
+                    size_t data_len, int may_discard);
+
+int http_extra_send_prealloc(http_connection_t *hc, const void *data,
+                             size_t data_len, int may_discard);
+
+static inline void http_send_begin(http_connection_t *hc)
+{
+  atomic_add(&hc->hc_extra_insend, 1);
+  if (atomic_get(&hc->hc_extra_chunks) > 0)
+    http_extra_flush_partial(hc);
+}
+
+static inline void http_send_end(http_connection_t *hc)
+{
+  atomic_dec(&hc->hc_extra_insend, 1);
+  if (atomic_get(&hc->hc_extra_chunks) > 0)
+    http_extra_flush(hc);
+}
+
 void http_send_header(http_connection_t *hc, int rc, const char *content, 
 		      int64_t contentlen, const char *encoding,
 		      const char *location, int maxage, const char *range,
 		      const char *disposition, http_arg_list_t *args);
 
+int http_send_header_websocket(http_connection_t *hc, const char *protocol);
+
+int http_websocket_send(http_connection_t *hc, uint8_t *buf, uint64_t buflen, int opcode);
+
+int http_websocket_send_json(http_connection_t *hc, htsmsg_t *msg);
+
+int http_websocket_read(http_connection_t *hc, htsmsg_t **_res, int timeout);
+
 void http_serve_requests(http_connection_t *hc);
 
 void http_cancel(void *opaque);
+
+int http_check_local_ip(http_connection_t *hc);
 
 typedef int (http_callback_t)(http_connection_t *hc, 
 			      const char *remain, void *opaque);
@@ -219,6 +299,8 @@ typedef int (http_callback_t)(http_connection_t *hc,
 typedef char * (http_path_modify_t)(http_connection_t *hc,
                                     const char * path, int *cut);
                                  
+#define HTTP_PATH_NO_VERIFICATION    (1 << 0)
+#define HTTP_PATH_WEBSOCKET          (1 << 1)
 
 typedef struct http_path {
   LIST_ENTRY(http_path) hp_link;
@@ -226,7 +308,7 @@ typedef struct http_path {
   void *hp_opaque;
   http_callback_t *hp_callback;
   int hp_len;
-  int hp_no_verification;
+  uint32_t hp_flags;
   uint32_t hp_accessmask;
   http_path_modify_t *hp_path_modify;
 } http_path_t;
@@ -246,11 +328,9 @@ int http_access_verify(http_connection_t *hc, int mask);
 int http_access_verify_channel(http_connection_t *hc, int mask,
                                struct channel *ch);
 
-void http_deescape(char *s);
-
 void http_parse_args(http_arg_list_t *list, char *args);
 
-char *http_get_hostpath(http_connection_t *hc);
+char *http_get_hostpath(http_connection_t *hc, char *buf, size_t buflen);
 
 /*
  * HTTP/RTSP Client
@@ -274,7 +354,7 @@ struct http_client {
 
   TAILQ_ENTRY(http_client) hc_link;
 
-  pthread_mutex_t hc_mutex;
+  tvh_mutex_t  hc_mutex;
 
   int          hc_id;
   int          hc_fd;
@@ -367,8 +447,10 @@ struct http_client {
   void    (*hc_conn_closed)  (http_client_t *hc, int err);
 };
 
-void http_client_init ( const char *user_agent );
+void http_client_init ( void );
 void http_client_done ( void );
+
+const char * http_client_con2str(http_state_t state);
 
 http_client_t*
 http_client_connect ( void *aux, http_ver_t ver, const char *scheme,

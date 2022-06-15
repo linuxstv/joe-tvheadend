@@ -1,22 +1,10 @@
-#define __USE_GNU
-#include "tvheadend.h"
-#include <fcntl.h>
-#include <sys/types.h>          /* See NOTES */
-#include <sys/socket.h>
+#define _GNU_SOURCE
 #include <sys/stat.h>
-#include <sys/resource.h>
-#include <unistd.h>
-#include <signal.h>
-#include <pthread.h>
-
-#ifdef PLATFORM_LINUX
-#include <sys/prctl.h>
-#include <sys/syscall.h>
-#endif
-
-#ifdef PLATFORM_FREEBSD
-#include <pthread_np.h>
-#endif
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <fcntl.h>
+#include "tvheadend.h"
+#include "tvhregex.h"
 
 /*
  * filedescriptor routines
@@ -27,11 +15,11 @@ tvh_open(const char *pathname, int flags, mode_t mode)
 {
   int fd;
 
-  pthread_mutex_lock(&fork_lock);
+  tvh_mutex_lock(&fork_lock);
   fd = open(pathname, flags, mode);
   if (fd != -1)
     fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
-  pthread_mutex_unlock(&fork_lock);
+  tvh_mutex_unlock(&fork_lock);
   return fd;
 }
 
@@ -40,11 +28,11 @@ tvh_socket(int domain, int type, int protocol)
 {
   int fd;
 
-  pthread_mutex_lock(&fork_lock);
+  tvh_mutex_lock(&fork_lock);
   fd = socket(domain, type, protocol);
   if (fd != -1)
     fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
-  pthread_mutex_unlock(&fork_lock);
+  tvh_mutex_unlock(&fork_lock);
   return fd;
 }
 
@@ -52,7 +40,7 @@ int
 tvh_pipe(int flags, th_pipe_t *p)
 {
   int fd[2], err;
-  pthread_mutex_lock(&fork_lock);
+  tvh_mutex_lock(&fork_lock);
   err = pipe(fd);
   if (err != -1) {
     fcntl(fd[0], F_SETFD, fcntl(fd[0], F_GETFD) | FD_CLOEXEC);
@@ -62,7 +50,7 @@ tvh_pipe(int flags, th_pipe_t *p)
     p->rd = fd[0];
     p->wr = fd[1];
   }
-  pthread_mutex_unlock(&fork_lock);
+  tvh_mutex_unlock(&fork_lock);
   return err;
 }
 
@@ -99,174 +87,38 @@ tvh_write(int fd, const void *buf, size_t len)
   return len ? 1 : 0;
 }
 
+int
+tvh_nonblock_write(int fd, const void *buf, size_t len)
+{
+  ssize_t c;
+
+  while (len) {
+    c = write(fd, buf, len);
+    if (c < 0) {
+      if (errno == EINTR)
+        continue;
+      break;
+    }
+    len -= c;
+    buf += c;
+  }
+
+  return len ? 1 : 0;
+}
+
 FILE *
 tvh_fopen(const char *filename, const char *mode)
 {
   FILE *f;
   int fd;
-  pthread_mutex_lock(&fork_lock);
+  tvh_mutex_lock(&fork_lock);
   f = fopen(filename, mode);
   if (f) {
     fd = fileno(f);
     fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
   }
-  pthread_mutex_unlock(&fork_lock);
+  tvh_mutex_unlock(&fork_lock);
   return f;
-}
-
-/*
- * thread routines
- */
-
-static void doquit(int sig)
-{
-}
-
-struct
-thread_state {
-  void *(*run)(void*);
-  void *arg;
-  char name[17];
-};
-
-static void *
-thread_wrapper ( void *p )
-{
-  struct thread_state *ts = p;
-  sigset_t set;
-
-#if defined(PLATFORM_LINUX)
-  /* Set name */
-  prctl(PR_SET_NAME, ts->name);
-#elif defined(PLATFORM_FREEBSD)
-  /* Set name of thread */
-  pthread_set_name_np(pthread_self(), ts->name);
-#elif defined(PLATFORM_DARWIN)
-  pthread_setname_np(ts->name);
-#endif
-
-  sigemptyset(&set);
-  sigaddset(&set, SIGTERM);
-  sigaddset(&set, SIGQUIT);
-  pthread_sigmask(SIG_UNBLOCK, &set, NULL);
-
-  signal(SIGTERM, doexit);
-  signal(SIGQUIT, doquit);
-
-  /* Run */
-  tvhtrace(LS_THREAD, "created thread %ld [%s / %p(%p)]",
-           (long)pthread_self(), ts->name, ts->run, ts->arg);
-  void *r = ts->run(ts->arg);
-  free(ts);
-
-  return r;
-}
-
-int
-tvhthread_create
-  (pthread_t *thread, const pthread_attr_t *attr,
-   void *(*start_routine) (void *), void *arg, const char *name)
-{
-  int r;
-  struct thread_state *ts = calloc(1, sizeof(struct thread_state));
-  strncpy(ts->name, "tvh:", 4);
-  strncpy(ts->name+4, name, sizeof(ts->name)-4);
-  ts->name[sizeof(ts->name)-1] = '\0';
-  ts->run  = start_routine;
-  ts->arg  = arg;
-  r = pthread_create(thread, attr, thread_wrapper, ts);
-  return r;
-}
-
-/* linux style: -19 .. 20 */
-int
-tvhtread_renice(int value)
-{
-  int ret = 0;
-#ifdef SYS_gettid
-  pid_t tid;
-  tid = syscall(SYS_gettid);
-  ret = setpriority(PRIO_PROCESS, tid, value);
-#elif ENABLE_ANDROID
-  pid_t tid;
-  tid = gettid();
-  ret = setpriority(PRIO_PROCESS, tid, value);
-#else
-#warning "Implement renice for your platform!"
-#endif
-  return ret;
-}
-
-int
-tvh_mutex_timedlock
-  ( pthread_mutex_t *mutex, int64_t usec )
-{
-  int64_t finish = getfastmonoclock() + usec;
-  int retcode;
-
-  while ((retcode = pthread_mutex_trylock (mutex)) == EBUSY) {
-    if (getfastmonoclock() >= finish)
-      return ETIMEDOUT;
-
-    tvh_safe_usleep(10000);
-  }
-
-  return retcode;
-}
-
-/*
- * thread condition variables - monotonic clocks
- */
-
-int
-tvh_cond_init
-  ( tvh_cond_t *cond )
-{
-  int r;
-
-  pthread_condattr_t attr;
-  pthread_condattr_init(&attr);
-  r = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
-  if (r) {
-    fprintf(stderr, "Unable to set monotonic clocks for conditions! (%d)", r);
-    abort();
-  }
-  return pthread_cond_init(&cond->cond, &attr);
-}
-
-int
-tvh_cond_destroy
-  ( tvh_cond_t *cond )
-{
-  return pthread_cond_destroy(&cond->cond);
-}
-
-int
-tvh_cond_signal
-  ( tvh_cond_t *cond, int broadcast )
-{
-  if (broadcast)
-    return pthread_cond_broadcast(&cond->cond);
-  else
-    return pthread_cond_signal(&cond->cond);
-}
-
-int
-tvh_cond_wait
-  ( tvh_cond_t *cond, pthread_mutex_t *mutex)
-{
-  return pthread_cond_wait(&cond->cond, mutex);
-}
-
-int
-tvh_cond_timedwait
-  ( tvh_cond_t *cond, pthread_mutex_t *mutex, int64_t monoclock )
-{
-  struct timespec ts;
-  ts.tv_sec = monoclock / MONOCLOCK_RESOLUTION;
-  ts.tv_nsec = (monoclock % MONOCLOCK_RESOLUTION) *
-               (1000000000ULL/MONOCLOCK_RESOLUTION);
-  return pthread_cond_timedwait(&cond->cond, mutex, &ts);
 }
 
 /*
@@ -293,6 +145,9 @@ tvh_safe_usleep(int64_t us)
 int64_t
 tvh_usleep(int64_t us)
 {
+#if defined(PLATFORM_DARWIN)
+  return usleep(us);
+#else
   struct timespec ts;
   int64_t val;
   int r;
@@ -305,11 +160,18 @@ tvh_usleep(int64_t us)
   if (ERRNO_AGAIN(r))
     return val;
   return r ? -r : 0;
+#endif
 }
 
 int64_t
 tvh_usleep_abs(int64_t us)
 {
+#if defined(PLATFORM_DARWIN)
+  /* Convert to relative wait */
+  int64_t now = getmonoclock();
+  int64_t relative = us - now;
+  return tvh_usleep(relative);
+#else
   struct timespec ts;
   int64_t val;
   int r;
@@ -322,6 +184,7 @@ tvh_usleep_abs(int64_t us)
   if (ERRNO_AGAIN(r))
     return val;
   return r ? -r : 0;
+#endif
 }
 
 /*
@@ -381,3 +244,229 @@ tvh_qsort_r(void *base, size_t nmemb, size_t size, int (*compar)(const void *, c
     qsort_r(base, nmemb, size, compar, arg);
 #endif
 }
+
+/*
+ * Regex stuff
+ */
+void regex_free(tvh_regex_t *regex)
+{
+#if ENABLE_PCRE || ENABLE_PCRE2
+  if (regex->is_posix) {
+#endif
+    regfree(&regex->re_posix_code);
+    regex->re_posix_text = NULL;
+#if ENABLE_PCRE || ENABLE_PCRE2
+  } else {
+#if ENABLE_PCRE
+#ifdef PCRE_CONFIG_JIT
+#if PCRE_STUDY_JIT_COMPILE
+    if (regex->re_jit_stack) {
+      pcre_jit_stack_free(regex->re_jit_stack);
+      regex->re_jit_stack = NULL;
+    }
+#endif
+    pcre_free_study(regex->re_extra);
+#else
+    pcre_free(regex->re_extra);
+#endif
+    pcre_free(regex->re_code);
+    regex->re_extra = NULL;
+    regex->re_code = NULL;
+    regex->re_text = NULL;
+#elif ENABLE_PCRE2
+    pcre2_jit_stack_free(regex->re_jit_stack);
+    pcre2_match_data_free(regex->re_match);
+    pcre2_code_free(regex->re_code);
+    pcre2_match_context_free(regex->re_mcontext);
+    regex->re_match = NULL;
+    regex->re_code = NULL;
+    regex->re_mcontext = NULL;
+    regex->re_jit_stack = NULL;
+#endif
+  }
+#endif
+}
+
+int regex_compile(tvh_regex_t *regex, const char *re_str, int flags, int subsys)
+{
+#if ENABLE_PCRE || ENABLE_PCRE2
+  regex->is_posix = 0;
+  if (flags & TVHREGEX_POSIX) {
+    regex->is_posix = 1;
+#endif
+    int options = REG_EXTENDED;
+    if (flags & TVHREGEX_CASELESS)
+      options |= REG_ICASE;
+    if (!regcomp(&regex->re_posix_code, re_str, options))
+      return 0;
+    tvherror(subsys, "Unable to compile regex '%s'", re_str);
+    return -1;
+#if ENABLE_PCRE || ENABLE_PCRE2
+  } else {
+#if ENABLE_PCRE
+    const char *estr;
+    int eoff;
+    int options = PCRE_UTF8;
+    if (flags & TVHREGEX_CASELESS)
+      options |= PCRE_CASELESS;
+#if PCRE_STUDY_JIT_COMPILE
+    regex->re_jit_stack = NULL;
+#endif
+    regex->re_extra = NULL;
+    regex->re_code = pcre_compile(re_str, options, &estr, &eoff, NULL);
+    if (regex->re_code == NULL) {
+      tvherror(subsys, "Unable to compile PCRE '%s': %s", re_str, estr);
+    } else {
+      regex->re_extra = pcre_study(regex->re_code,
+                                   PCRE_STUDY_JIT_COMPILE, &estr);
+      if (regex->re_extra == NULL && estr)
+        tvherror(subsys, "Unable to study PCRE '%s': %s", re_str, estr);
+      else {
+#if PCRE_STUDY_JIT_COMPILE
+        regex->re_jit_stack = pcre_jit_stack_alloc(32*1024, 512*1024);
+        if (regex->re_jit_stack)
+          pcre_assign_jit_stack(regex->re_extra, NULL, regex->re_jit_stack);
+#endif
+        return 0;
+      }
+    }
+    return -1;
+#elif ENABLE_PCRE2
+    PCRE2_UCHAR8 ebuf[128];
+    int ecode;
+    PCRE2_SIZE eoff;
+    size_t jsz;
+    uint32_t options;
+    assert(regex->re_jit_stack == NULL);
+    regex->re_jit_stack = NULL;
+    regex->re_match = NULL;
+    regex->re_mcontext = pcre2_match_context_create(NULL);
+    options = PCRE2_UTF;
+    if (flags & TVHREGEX_CASELESS)
+      options |= PCRE2_CASELESS;
+    regex->re_code = pcre2_compile((PCRE2_SPTR8)re_str, -1, options,
+                                   &ecode, &eoff, NULL);
+    if (regex->re_code == NULL) {
+      (void)pcre2_get_error_message(ecode, ebuf, 120);
+      tvherror(subsys, "Unable to compile PCRE2 '%s': %s", re_str, ebuf);
+    } else {
+      regex->re_match = pcre2_match_data_create(TVHREGEX_MAX_MATCHES, NULL);
+      if (re_str[0] && pcre2_jit_compile(regex->re_code, PCRE2_JIT_COMPLETE) >= 0) {
+        jsz = 0;
+        if (pcre2_pattern_info(regex->re_code, PCRE2_INFO_JITSIZE, &jsz) >= 0 && jsz > 0) {
+          regex->re_jit_stack = pcre2_jit_stack_create(32 * 1024, 512 * 1024, NULL);
+          if (regex->re_jit_stack)
+            pcre2_jit_stack_assign(regex->re_mcontext, NULL, regex->re_jit_stack);
+        }
+      }
+      return 0;
+    }
+    return -1;
+#endif
+  }
+#endif
+}
+
+int regex_match(tvh_regex_t *regex, const char *str)
+{
+#if ENABLE_PCRE || ENABLE_PCRE2
+  if (regex->is_posix) {
+#endif
+    regex->re_posix_text = str;
+    return regexec(&regex->re_posix_code, str, TVHREGEX_MAX_MATCHES, regex->re_posix_match, 0);
+#if ENABLE_PCRE || ENABLE_PCRE2
+  } else {
+#if ENABLE_PCRE
+    regex->re_text = str;
+    regex->re_matches =
+      pcre_exec(regex->re_code, regex->re_extra,
+                str, strlen(str), 0, 0, regex->re_match, TVHREGEX_MAX_MATCHES * 3);
+    return regex->re_matches < 0;
+#elif ENABLE_PCRE2
+    return pcre2_match(regex->re_code, (PCRE2_SPTR8)str, -1, 0, 0,
+                       regex->re_match, regex->re_mcontext) <= 0;
+#endif
+  }
+#endif
+}
+
+int regex_match_substring(tvh_regex_t *regex, unsigned number, char *buf, size_t size_buf)
+{
+  assert(buf);
+  if (number >= TVHREGEX_MAX_MATCHES)
+    return -2;
+#if ENABLE_PCRE || ENABLE_PCRE2
+  if (regex->is_posix) {
+#endif
+    if (regex->re_posix_match[number].rm_so == -1)
+      return -1;
+    ssize_t size = regex->re_posix_match[number].rm_eo - regex->re_posix_match[number].rm_so;
+    if (size < 0 || size > (size_buf - 1))
+      return -1;
+    strlcpy(buf, regex->re_posix_text + regex->re_posix_match[number].rm_so, size + 1);
+    return 0;
+#if ENABLE_PCRE || ENABLE_PCRE2
+  } else {
+#if ENABLE_PCRE
+    return pcre_copy_substring(regex->re_text, regex->re_match,
+                               (regex->re_matches == 0)
+                               ? TVHREGEX_MAX_MATCHES
+                               : regex->re_matches,
+                               number, buf, size_buf) < 0;
+#elif ENABLE_PCRE2
+    PCRE2_SIZE psiz = size_buf;
+    return pcre2_substring_copy_bynumber(regex->re_match, number, (PCRE2_UCHAR8*)buf, &psiz);
+#endif
+  }
+#endif
+}
+
+int regex_match_substring_length(tvh_regex_t *regex, unsigned number)
+{
+  if (number >= TVHREGEX_MAX_MATCHES)
+    return -2;
+#if ENABLE_PCRE || ENABLE_PCRE2
+  if (regex->is_posix) {
+#endif
+    if (regex->re_posix_match[number].rm_so == -1)
+      return -1;
+    return regex->re_posix_match[number].rm_eo - regex->re_posix_match[number].rm_so;
+#if ENABLE_PCRE || ENABLE_PCRE2
+  } else {
+#if ENABLE_PCRE
+  if (number >= regex->re_matches)
+    return -1;
+  if (regex->re_match[number * 2] == -1)
+    return -1;
+  return regex->re_match[number * 2 + 1] - regex->re_match[number * 2];
+#elif ENABLE_PCRE2
+  PCRE2_SIZE len;
+  int rc = pcre2_substring_length_bynumber(regex->re_match, number, &len);
+  return (!rc) ? len : -1;
+#endif
+  }
+#endif
+}
+
+/*
+ * Sanitizer helpers to avoid false positives
+ */
+#if ENABLE_CCLANG_THREADSAN
+void *blacklisted_memcpy(void *dest, const void *src, size_t n)
+  __attribute__((no_sanitize("thread")))
+{
+  uint8_t *d = dest;
+  const uint8_t *s = src;
+  while (n-- > 0) *d++ = *s++;
+  return dest;
+}
+
+void *dlsym(void *handle, const char *symbol);
+
+int blacklisted_close(int fd)
+  __attribute__((no_sanitize("thread")))
+{
+  // close(fd); // sanitizer reports errors in close()
+  return 0;
+}
+#endif

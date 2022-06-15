@@ -134,7 +134,7 @@ scanfile_load_atsc ( dvb_mux_conf_t *mux, const char *line )
 
   r = sscanf(line, "%u %s", &mux->dmc_fe_freq, qam);
   if (r != 2) return 1;
-  dvb_mux_conf_init(mux, DVB_SYS_ATSC);
+  dvb_mux_conf_init(NULL, mux, DVB_SYS_ATSC);
   if ((mux->dmc_fe_modulation = dvb_str2qam(qam)) == -1) return 1;
 
   return 0;
@@ -148,7 +148,7 @@ scanfile_load_dvbt ( dvb_mux_conf_t *mux, const char *line )
 
   if (*line == '2') {
     unsigned int system_id;
-    dvb_mux_conf_init(mux, DVB_SYS_DVBT2);
+    dvb_mux_conf_init(NULL, mux, DVB_SYS_DVBT2);
     r = sscanf(line+1, "%u %s", &mux->dmc_fe_stream_id, bw);
     if (r == 2 && mux->dmc_fe_stream_id < 1000 && strstr(bw, "MHz") == 0) {
       r = sscanf(line+1, "%u %u %u %10s %10s %10s %10s %10s %10s %10s",
@@ -163,7 +163,7 @@ scanfile_load_dvbt ( dvb_mux_conf_t *mux, const char *line )
       if(r != 9) return 1;
     }
   } else {
-    dvb_mux_conf_init(mux, DVB_SYS_DVBT);
+    dvb_mux_conf_init(NULL, mux, DVB_SYS_DVBT);
     r = sscanf(line, "%u %10s %10s %10s %10s %10s %10s %10s",
 	             &mux->dmc_fe_freq, bw, fec, fec2, qam, mode, guard, hier);
     if(r != 8) return 1;
@@ -191,7 +191,7 @@ scanfile_load_dvbs ( dvb_mux_conf_t *mux, const char *line )
     line++;
   }
 
-  dvb_mux_conf_init(mux, v2 ? DVB_SYS_DVBS2 : DVB_SYS_DVBS);
+  dvb_mux_conf_init(NULL, mux, v2 ? DVB_SYS_DVBS2 : DVB_SYS_DVBS);
 
   r = sscanf(line, "%u %s %u %s %s %s %d %d %d",
 	           &mux->dmc_fe_freq, pol, &mux->u.dmc_fe_qpsk.symbol_rate,
@@ -224,7 +224,7 @@ scanfile_load_dvbc ( dvb_mux_conf_t *mux, const char *line )
 	           &mux->dmc_fe_freq, &mux->u.dmc_fe_qam.symbol_rate, fec, qam);
   if(r != 4) return 1;
 
-  dvb_mux_conf_init(mux, DVB_SYS_DVBC_ANNEX_A);
+  dvb_mux_conf_init(NULL, mux, DVB_SYS_DVBC_ANNEX_A);
   if ((mux->u.dmc_fe_qam.fec_inner  = dvb_str2fec(fec)) == -1) return 1;
   if ((mux->dmc_fe_modulation       = dvb_str2qam(qam)) == -1) return 1;
 
@@ -331,12 +331,11 @@ scanfile_create_network
 {
   scanfile_region_t *reg = NULL;
   scanfile_network_t *net;
-  char buf[256], buf2[256], buf3[256], *str;
+  char buf[256], buf2[263], buf3[270], *str;
   int opos;
 
   /* Region */
-  strncpy(buf, name, sizeof(buf));
-  buf[sizeof(buf)-1] = '\0';
+  strlcpy(buf, name, sizeof(buf));
   if (!strcmp(type, "dvb-s")) {
     reg = scanfile_region_create(type, "geo", "Geo-synchronous Orbit");
   } else {
@@ -515,7 +514,7 @@ scanfile_load_dvbv5
   if (!x || (int)mux->dmc_fe_delsys < 0)
     mux_fail(r, "wrong system '%s'", x);
 
-  dvb_mux_conf_init(mux, mux->dmc_fe_delsys);
+  dvb_mux_conf_init(NULL, mux, mux->dmc_fe_delsys);
 
   if (mux->dmc_fe_delsys == DVB_SYS_DVBT ||
       mux->dmc_fe_delsys == DVB_SYS_DVBT2) {
@@ -595,6 +594,10 @@ scanfile_load_dvbv5
       mux->dmc_fe_pls_mode = (r>>26)&0x3;
       mux->dmc_fe_pls_code = (r>>8)&0x3FFFF;
     }
+
+    if (htsmsg_get_u32(l, "PLS_CODE", &mux->dmc_fe_pls_code) == 0)
+      mux->dmc_fe_pls_mode = 1;
+    htsmsg_get_u32(l, "PLS_MODE", &mux->dmc_fe_pls_mode);
 
     if ((x = htsmsg_get_str(l, "POLARIZATION"))) {
       char pol[2];
@@ -908,11 +911,11 @@ scanfile_init ( const char *muxconf_path, int lock )
 
   if (!initialized) {
     if (lock)
-      pthread_mutex_lock(&global_lock);
+      tvh_mutex_lock(&global_lock);
     memoryinfo_register(&scanfile_memoryinfo);
     initialized = 1;
     if (lock)
-      pthread_mutex_unlock(&global_lock);
+      tvh_mutex_unlock(&global_lock);
   }
 
   scanfile_total_load = 0;
@@ -943,12 +946,12 @@ scanfile_init ( const char *muxconf_path, int lock )
     scanfile_regions_load = NULL;
   } else {
     if (lock)
-      pthread_mutex_lock(&global_lock);
+      tvh_mutex_lock(&global_lock);
     scanfile_done();
     scanfile_regions = scanfile_regions_load;
     scanfile_regions_load = NULL;
     if (lock)
-      pthread_mutex_unlock(&global_lock);
+      tvh_mutex_unlock(&global_lock);
   }
 }
 

@@ -28,7 +28,7 @@
 #include "service.h"
 #include "input/mpegts/dvb.h"
 #include "muxer_pass.h"
-#include "dvr/dvr.h"
+#include "spawn.h"
 
 typedef struct pass_muxer {
   muxer_t;
@@ -36,8 +36,10 @@ typedef struct pass_muxer {
   /* File descriptor stuff */
   off_t pm_off;
   int   pm_fd;
+  int   pm_ofd;
   int   pm_seekable;
   int   pm_error;
+  int   pm_spawn_pid;
 
   /* Filename is also used for logging */
   char *pm_filename;
@@ -47,14 +49,21 @@ typedef struct pass_muxer {
 
   /* TS muxing */
   uint8_t  pm_rewrite_sdt;
+  uint8_t  pm_rewrite_nit;
   uint8_t  pm_rewrite_eit;
 
   uint16_t pm_pmt_pid;
-  uint16_t pm_service_id;
+  uint16_t pm_src_sid;
+  uint16_t pm_dst_sid;
+  uint16_t pm_src_tsid;
+  uint16_t pm_dst_tsid;
+  uint16_t pm_src_onid;
+  uint16_t pm_dst_onid;
 
   mpegts_psi_table_t pm_pat;
   mpegts_psi_table_t pm_pmt;
   mpegts_psi_table_t pm_sdt;
+  mpegts_psi_table_t pm_nit;
   mpegts_psi_table_t pm_eit;
 
 } pass_muxer_t;
@@ -66,7 +75,6 @@ pass_muxer_write(muxer_t *m, const void *data, size_t size);
 /*
  * Rewrite a PAT packet to only include the service included in the transport stream.
  */
-
 static void
 pass_muxer_pat_cb(mpegts_psi_table_t *mt, const uint8_t *buf, int len)
 {
@@ -83,10 +91,12 @@ pass_muxer_pat_cb(mpegts_psi_table_t *mt, const uint8_t *buf, int len)
 
   out[1] = 0x80;
   out[2] = 13; /* section_length (number of bytes after this field, including CRC) */
+  out[3] = pm->pm_dst_tsid >> 8;
+  out[4] = pm->pm_dst_tsid;
   out[7] = 0;
 
-  out[8] = (pm->pm_service_id & 0xff00) >> 8;
-  out[9] = pm->pm_service_id & 0x00ff;
+  out[8] = pm->pm_dst_sid >> 8;
+  out[9] = pm->pm_dst_sid;
   out[10] = 0xe0 | ((pm->pm_pmt_pid & 0x1f00) >> 8);
   out[11] = pm->pm_pmt_pid & 0x00ff;
 
@@ -121,10 +131,12 @@ pass_muxer_pmt_cb(mpegts_psi_table_t *mt, const uint8_t *buf, int len)
     return;
 
   pm = (pass_muxer_t*)mt->mt_opaque;
-  if (sid != pm->pm_service_id)
+  if (sid != pm->pm_src_sid)
     return;
 
-  memcpy(out + ol, buf, 9);
+  out[ol + 0] = pm->pm_dst_sid >> 8;
+  out[ol + 1] = pm->pm_dst_sid & 0xff;
+  memcpy(out + ol + 2, buf + 2, 7);
 
   ol  += 9;     /* skip common descriptors */
   buf += 9 + l;
@@ -148,7 +160,7 @@ pass_muxer_pmt_cb(mpegts_psi_table_t *mt, const uint8_t *buf, int len)
 
     for (i = 0; i < pm->pm_ss->ss_num_components; i++) {
       ssc = &pm->pm_ss->ss_components[i];
-      if (ssc->ssc_pid == pid)
+      if (ssc->es_pid == pid)
         break;
     }
     if (i < pm->pm_ss->ss_num_components) {
@@ -192,10 +204,18 @@ pass_muxer_sdt_cb(mpegts_psi_table_t *mt, const uint8_t *buf, int len)
   memcpy(out, buf, ol);
   buf += ol;
   len -= ol;
+
+  out[3] = pm->pm_dst_tsid >> 8;
+  out[4] = pm->pm_dst_tsid;
+  out[8] = pm->pm_dst_onid >> 8;
+  out[9] = pm->pm_dst_onid;
+
   while (len >= 5) {
     sid = (buf[0] << 8) | buf[1];
     l = (buf[3] & 0x0f) << 8 | buf[4];
-    if (sid != pm->pm_service_id) {
+    if (l > len - 5)
+      return;
+    if (sid != pm->pm_src_sid) {
       buf += l + 5;
       len -= l + 5;
       continue;
@@ -204,7 +224,9 @@ pass_muxer_sdt_cb(mpegts_psi_table_t *mt, const uint8_t *buf, int len)
       tvherror(LS_PASS, "SDT entry too long (%i)", l);
       return;
     }
-    memcpy(out + ol, buf, l + 5);
+    out[ol + 0] = pm->pm_dst_sid >> 8;
+    out[ol + 1] = pm->pm_dst_sid & 0xff;
+    memcpy(out + ol + 2, buf + 2, l + 3);
     /* set free CA */
     out[ol + 3] = out[ol + 3] & ~0x10;
     ol += l + 5;
@@ -227,30 +249,132 @@ pass_muxer_sdt_cb(mpegts_psi_table_t *mt, const uint8_t *buf, int len)
  *
  */
 static void
+pass_muxer_nit_cb(mpegts_psi_table_t *mt, const uint8_t *buf, int len)
+{
+  pass_muxer_t *pm;
+  uint8_t out[4096], *ob, dtag;
+  int l, ol, lptr, dlen;
+
+  /* filter out the other networks */
+  if (buf[0] != 0x40)
+    return;
+
+  if (len < 10)
+    return;
+
+  pm = (pass_muxer_t*)mt->mt_opaque;
+
+  memcpy(out, buf, ol = 10);
+  l = (buf[8] & 0x0f) << 8 | buf[9];
+  buf += 10;
+  len -= 10;
+
+  if (pm->m_config.u.pass.m_rewrite_sid > 0) {
+    out[3] = 0;
+    out[4] = 1;
+  }
+
+  while (l > 1 && len > 1) {
+    dtag = buf[0];
+    dlen = buf[1];
+    if (dtag == DVB_DESC_PRIVATE_DATA) {
+      if (sizeof(out) - 32 < ol) {
+        tvherror(LS_PASS, "NIT entry too long (%i)", ol);
+        return;
+      }
+      memcpy(out + ol, buf, dlen + 2);
+      ol += dlen + 2;
+    }
+    dlen += 2;
+    buf += dlen;
+    len -= dlen;
+      l -= dlen;
+  }
+  out[8] &= 0xf0;
+  out[8] |= ((ol - 10) >> 8) & 0x0f;
+  out[9] = (ol - 10) & 0xff;
+
+  if (sizeof(out) - 32 < ol) {
+    tvherror(LS_PASS, "NIT entry too long (%i)", ol);
+    return;
+  }
+
+  /* mux info length */
+  lptr = ol;
+  ol += 2;
+
+  /* mux info */
+  out[ol++] = pm->pm_dst_tsid >> 8;
+  out[ol++] = pm->pm_dst_tsid;
+  out[ol++] = pm->pm_dst_onid >> 8;
+  out[ol++] = pm->pm_dst_onid;
+  /* mux tags */
+  out[ol++] = 0xf0;
+  out[ol++] = 5;
+  out[ol++] = DVB_DESC_SERVICE_LIST;
+  out[ol++] = 3;
+  out[ol++] = pm->pm_dst_sid >> 8;
+  out[ol++] = pm->pm_dst_sid;
+  out[ol++] = 0x11;
+  /* update section length */
+  out[lptr+0] = 0xf0 | (ol - lptr - 2) >> 8;
+  out[lptr+1] = (ol - lptr - 2) & 0xff;
+
+  /* update section length */
+  out[1] = (out[1] & 0xf0) | ((ol + 4 - 3) >> 8);
+  out[2] = (ol + 4 - 3) & 0xff;
+
+  ol = dvb_table_append_crc32(out, ol, sizeof(out));
+
+  if (ol > 0 && (l = dvb_table_remux(mt, out, ol, &ob)) > 0) {
+    pass_muxer_write((muxer_t *)pm, ob, l);
+    free(ob);
+  }
+}
+
+/*
+ *
+ */
+static void
 pass_muxer_eit_cb(mpegts_psi_table_t *mt, const uint8_t *buf, int len)
 {
   pass_muxer_t *pm;
   uint16_t sid;
-  uint8_t *out;
+  uint8_t *sbuf, *out;
   int olen;
 
-  /* filter out the other transponders */
-  if ((buf[0] < 0x50 && buf[0] != 0x4e) || buf[0] > 0x5f || len < 14)
+  /* filter out wrong tables */
+  if (buf[0] < 0x4e || buf[0] > 0x6f || len < 14)
     return;
 
   pm = (pass_muxer_t*)mt->mt_opaque;
   sid = (buf[3] << 8) | buf[4];
-  if (sid != pm->pm_service_id)
-    return;
 
   /* TODO: set free_CA_mode bit to zero */
 
-  len = dvb_table_append_crc32((uint8_t *)buf, len, len + 4);
+  sbuf = malloc(len + 4);
+  memcpy(sbuf, buf, len);
+  sbuf[3] = pm->pm_dst_sid >> 8;
+  sbuf[4] = pm->pm_dst_sid;
+  sbuf[8] = pm->pm_dst_tsid >> 8;
+  sbuf[9] = pm->pm_dst_tsid;
+  sbuf[10] = pm->pm_dst_onid >> 8;
+  sbuf[11] = pm->pm_dst_onid;
 
-  if (len > 0 && (olen = dvb_table_remux(mt, buf, len, &out)) > 0) {
+  if (sid != pm->pm_src_sid) {
+    len = 14; /* no events, just keep the SI tables consistent */
+    sbuf[1] &= 0xf0;
+    sbuf[1] |= ((len - 3 + 4) >> 8) & 0x0f;
+    sbuf[2] = (len - 3 + 4) & 0xff;
+  }
+
+  len = dvb_table_append_crc32(sbuf, len, len + 4);
+  if (len > 0 && (olen = dvb_table_remux(mt, sbuf, len, &out)) > 0) {
     pass_muxer_write((muxer_t *)pm, out, olen);
     free(out);
   }
+
+  free(sbuf);
 }
 
 /**
@@ -265,6 +389,10 @@ pass_muxer_mime(muxer_t* m, const struct streaming_start *ss)
   muxer_container_type_t mc;
   const streaming_start_component_t *ssc;
   const source_info_t *si = &ss->ss_si;
+  const char *mime = m->m_config.u.pass.m_mime;
+
+  if (mime && mime[0])
+    return mime;
 
   has_audio = 0;
   has_video = 0;
@@ -275,8 +403,8 @@ pass_muxer_mime(muxer_t* m, const struct streaming_start *ss)
     if(ssc->ssc_disabled)
       continue;
 
-    has_video |= SCT_ISVIDEO(ssc->ssc_type);
-    has_audio |= SCT_ISAUDIO(ssc->ssc_type);
+    has_video |= SCT_ISVIDEO(ssc->es_type);
+    has_audio |= SCT_ISAUDIO(ssc->es_type);
   }
 
   if(si->si_type == S_MPEG_TS)
@@ -305,34 +433,51 @@ pass_muxer_reconfigure(muxer_t* m, const struct streaming_start *ss)
   const streaming_start_component_t *ssc;
   int i;
 
-  pm->pm_service_id = ss->ss_service_id;
-  pm->pm_pmt_pid    = ss->ss_pmt_pid;
-  pm->pm_rewrite_sdt = !!pm->m_config.m_rewrite_sdt;
-  pm->pm_rewrite_eit = !!pm->m_config.m_rewrite_eit;
+  pm->pm_src_sid     = ss->ss_service_id;
+  pm->pm_src_tsid    = ss->ss_si.si_tsid;
+  pm->pm_src_onid    = ss->ss_si.si_onid;
+  if (pm->m_config.u.pass.m_rewrite_sid > 0) {
+    pm->pm_dst_sid   = pm->m_config.u.pass.m_rewrite_sid;
+    pm->pm_dst_tsid  = 1;
+    pm->pm_dst_onid  = 1;
+  } else {
+    pm->pm_dst_sid   = pm->pm_src_sid;
+    pm->pm_dst_tsid  = pm->pm_src_tsid;
+    pm->pm_dst_onid  = pm->pm_src_onid;
+  }
+  pm->pm_pmt_pid     = ss->ss_pmt_pid;
+  pm->pm_rewrite_sdt = !!pm->m_config.u.pass.m_rewrite_sdt;
+  pm->pm_rewrite_nit = !!pm->m_config.u.pass.m_rewrite_nit;
+  pm->pm_rewrite_eit = !!pm->m_config.u.pass.m_rewrite_eit;
 
   for(i=0; i < ss->ss_num_components; i++) {
     ssc = &ss->ss_components[i];
-    if (!SCT_ISVIDEO(ssc->ssc_type) && !SCT_ISAUDIO(ssc->ssc_type))
+    if (!SCT_ISVIDEO(ssc->es_type) && !SCT_ISAUDIO(ssc->es_type))
       continue;
-    if (ssc->ssc_pid == DVB_SDT_PID && pm->pm_rewrite_sdt) {
+    if (ssc->es_pid == DVB_SDT_PID && pm->pm_rewrite_sdt) {
       tvhwarn(LS_PASS, "SDT PID shared with A/V, rewrite disabled");
       pm->pm_rewrite_sdt = 0;
     }
-    if (ssc->ssc_pid == DVB_EIT_PID && pm->pm_rewrite_eit) {
+    if (ssc->es_pid == DVB_NIT_PID && pm->pm_rewrite_nit) {
+      tvhwarn(LS_PASS, "NIT PID shared with A/V, rewrite disabled");
+      pm->pm_rewrite_nit = 0;
+    }
+    if (ssc->es_pid == DVB_EIT_PID && pm->pm_rewrite_eit) {
       tvhwarn(LS_PASS, "EIT PID shared with A/V, rewrite disabled");
       pm->pm_rewrite_eit = 0;
     }
   }
 
 
-  if (pm->m_config.m_rewrite_pmt) {
+  if (pm->m_config.u.pass.m_rewrite_pmt) {
 
     if (pm->pm_ss)
       streaming_start_unref(pm->pm_ss);
     pm->pm_ss = streaming_start_copy(ss);
 
     dvb_table_parse_done(&pm->pm_pmt);
-    dvb_table_parse_init(&pm->pm_pmt, "pass-pmt", LS_TBL_PASS, pm->pm_pmt_pid, pm);
+    dvb_table_parse_init(&pm->pm_pmt, "pass-pmt", LS_TBL_PASS, pm->pm_pmt_pid,
+                         DVB_PMT_BASE, DVB_PMT_MASK, pm);
   }
 
   return 0;
@@ -348,6 +493,36 @@ pass_muxer_init(muxer_t* m, struct streaming_start *ss, const char *name)
   return pass_muxer_reconfigure(m, ss);
 }
 
+/**
+ * Open the spawned task on demand
+ */
+static int
+pass_muxer_open2(pass_muxer_t *pm)
+{
+  const char *cmdline = pm->m_config.u.pass.m_cmdline;
+  char **argv = NULL;
+
+  pm->pm_spawn_pid = -1;
+  if (cmdline && cmdline[0]) {
+    argv = NULL;
+    if (spawn_parse_args(&argv, 64, cmdline, NULL))
+      goto error;
+    if (spawn_with_passthrough(argv[0], argv, NULL, pm->pm_ofd, &pm->pm_fd, &pm->pm_spawn_pid, 1)) {
+      tvherror(LS_PASS, "Unable to start pipe '%s' (wrong executable?)", cmdline);
+      goto error;
+    }
+    spawn_free_args(argv);
+  } else {
+    pm->pm_fd = pm->pm_ofd;
+  }
+  return 0;
+
+error:
+  if (argv)
+    spawn_free_args(argv);
+  pm->pm_error = ENOMEM;
+  return -1;
+}
 
 /**
  * Open the muxer as a stream muxer (using a non-seekable socket)
@@ -358,11 +533,11 @@ pass_muxer_open_stream(muxer_t *m, int fd)
   pass_muxer_t *pm = (pass_muxer_t*)m;
 
   pm->pm_off      = 0;
-  pm->pm_fd       = fd;
+  pm->pm_ofd      = fd;
   pm->pm_seekable = 0;
   pm->pm_filename = strdup("Live stream");
 
-  return 0;
+  return pass_muxer_open2(pm);
 }
 
 
@@ -394,9 +569,10 @@ pass_muxer_open_file(muxer_t *m, const char *filename)
 
   pm->pm_off      = 0;
   pm->pm_seekable = 1;
-  pm->pm_fd       = fd;
+  pm->pm_ofd      = fd;
   pm->pm_filename = strdup(filename);
-  return 0;
+
+  return pass_muxer_open2(pm);
 }
 
 
@@ -419,10 +595,13 @@ pass_muxer_write(muxer_t *m, const void *data, size_t size)
       /* this is an end-of-streaming notification */
       m->m_eos = 1;
     m->m_errors++;
-    muxer_cache_update(m, pm->pm_fd, pm->pm_off, 0);
-    pm->pm_off = lseek(pm->pm_fd, 0, SEEK_CUR);
+    if (pm->pm_seekable) {
+      muxer_cache_update(m, pm->pm_fd, pm->pm_off, 0);
+      pm->pm_off = lseek(pm->pm_fd, 0, SEEK_CUR);
+    }
   } else {
-    muxer_cache_update(m, pm->pm_fd, pm->pm_off, 0);
+    if (pm->pm_seekable)
+      muxer_cache_update(m, pm->pm_fd, pm->pm_off, 0);
     pm->pm_off += size;
   }
 }
@@ -440,8 +619,8 @@ pass_muxer_write_ts(muxer_t *m, pktbuf_t *pb)
   size_t  len = pktbuf_len(pb), len2;
   
   /* Rewrite PAT/PMT in operation */
-  if (pm->m_config.m_rewrite_pat || pm->m_config.m_rewrite_pmt ||
-      pm->pm_rewrite_sdt || pm->pm_rewrite_eit) {
+  if (pm->m_config.u.pass.m_rewrite_pat || pm->m_config.u.pass.m_rewrite_pmt ||
+      pm->pm_rewrite_sdt || pm->pm_rewrite_nit || pm->pm_rewrite_eit) {
 
     for (tsb = pktbuf_ptr(pb), len2 = pktbuf_len(pb), len = 0;
          len2 > 0; tsb += l, len2 -= l) {
@@ -450,9 +629,10 @@ pass_muxer_write_ts(muxer_t *m, pktbuf_t *pb)
       l = mpegts_word_count(tsb, len2, 0x001FFF00);
 
       /* Process */
-      if ( (pm->m_config.m_rewrite_pat && pid == DVB_PAT_PID) ||
-           (pm->m_config.m_rewrite_pmt && pid == pm->pm_pmt_pid) ||
+      if ( (pm->m_config.u.pass.m_rewrite_pat && pid == DVB_PAT_PID) ||
+           (pm->m_config.u.pass.m_rewrite_pmt && pid == pm->pm_pmt_pid) ||
            (pm->pm_rewrite_sdt && pid == DVB_SDT_PID) ||
+           (pm->pm_rewrite_nit && pid == DVB_NIT_PID) ||
            (pm->pm_rewrite_eit && pid == DVB_EIT_PID) ) {
 
         /* Flush */
@@ -472,6 +652,11 @@ pass_muxer_write_ts(muxer_t *m, pktbuf_t *pb)
         } else if (pid == DVB_SDT_PID) {
         
           dvb_table_parse(&pm->pm_sdt, "-", tsb, l, 1, 0, pass_muxer_sdt_cb);
+
+        /* NIT */
+        } else if (pid == DVB_NIT_PID) {
+        
+          dvb_table_parse(&pm->pm_nit, "-", tsb, l, 1, 0, pass_muxer_nit_cb);
 
         /* EIT */
         } else if (pid == DVB_EIT_PID) {
@@ -541,7 +726,10 @@ pass_muxer_close(muxer_t *m)
 {
   pass_muxer_t *pm = (pass_muxer_t*)m;
 
-  if(pm->pm_seekable && close(pm->pm_fd)) {
+  if(pm->pm_spawn_pid > 0)
+    spawn_kill(pm->pm_spawn_pid, tvh_kill_to_sig(pm->m_config.u.pass.m_killsig),
+               pm->m_config.u.pass.m_killtimeout);
+  if(pm->pm_seekable && close(pm->pm_ofd)) {
     pm->pm_error = errno;
     tvherror(LS_PASS, "%s: Unable to close file, close failed -- %s",
 	     pm->pm_filename, strerror(errno));
@@ -570,8 +758,11 @@ pass_muxer_destroy(muxer_t *m)
   dvb_table_parse_done(&pm->pm_pat);
   dvb_table_parse_done(&pm->pm_pmt);
   dvb_table_parse_done(&pm->pm_sdt);
+  dvb_table_parse_done(&pm->pm_nit);
   dvb_table_parse_done(&pm->pm_eit);
 
+  muxer_config_free(&pm->m_config);
+  muxer_hints_free(pm->m_hints);
   free(pm);
 }
 
@@ -580,7 +771,8 @@ pass_muxer_destroy(muxer_t *m)
  * Create a new passthrough muxer
  */
 muxer_t*
-pass_muxer_create(const muxer_config_t *m_cfg)
+pass_muxer_create(const muxer_config_t *m_cfg,
+                  const muxer_hints_t *hints)
 {
   pass_muxer_t *pm;
 
@@ -598,12 +790,22 @@ pass_muxer_create(const muxer_config_t *m_cfg)
   pm->m_close        = pass_muxer_close;
   pm->m_destroy      = pass_muxer_destroy;
   pm->pm_fd          = -1;
+  pm->pm_ofd         = -1;
+  pm->pm_spawn_pid   = -1;
 
-  dvb_table_parse_init(&pm->pm_pat, "pass-pat", LS_TBL_PASS, DVB_PAT_PID, pm);
-  dvb_table_parse_init(&pm->pm_pmt, "pass-pmt", LS_TBL_PASS, 100,         pm);
-  dvb_table_parse_init(&pm->pm_sdt, "pass-sdt", LS_TBL_PASS, DVB_SDT_PID, pm);
-  dvb_table_parse_init(&pm->pm_eit, "pass-eit", LS_TBL_PASS, DVB_EIT_PID, pm);
+  dvb_table_parse_init(&pm->pm_pat, "pass-pat", LS_TBL_PASS, DVB_PAT_PID,
+                       DVB_PAT_BASE, DVB_PAT_MASK, pm);
+  dvb_table_parse_init(&pm->pm_pmt, "pass-pmt", LS_TBL_PASS, 100,
+                       DVB_PMT_BASE, DVB_PMT_MASK, pm);
+  dvb_table_parse_init(&pm->pm_sdt, "pass-sdt", LS_TBL_PASS, DVB_SDT_PID,
+                       DVB_SDT_BASE, DVB_SDT_MASK, pm);
+  dvb_table_parse_init(&pm->pm_nit, "pass-nit", LS_TBL_PASS, DVB_NIT_PID,
+                       DVB_NIT_BASE, DVB_NIT_MASK, pm);
+  dvb_table_parse_init(&pm->pm_eit, "pass-eit", LS_TBL_PASS, DVB_EIT_PID,
+                       0, 0, pm);
+
+  if (m_cfg->u.pass.m_rewrite_sid > 0)
+    pm->m_caps |= MC_CAP_ANOTHER_SERVICE;
 
   return (muxer_t *)pm;
 }
-

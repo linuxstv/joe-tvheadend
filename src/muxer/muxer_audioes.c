@@ -79,14 +79,13 @@ audioes_get_component(muxer_t *m, const struct streaming_start *ss)
 
   for (i = count = 0; i < ss->ss_num_components;i++) {
     ssc = &ss->ss_components[i];
-
-    if ((!ssc->ssc_disabled) && (SCT_ISAUDIO(ssc->ssc_type))) {
-      if (m->m_config.m_force_type != MC_UNKNOWN) {
-        mc = audioes_muxer_type(ssc->ssc_type);
-        if (m->m_config.m_force_type != mc)
+    if ((!ssc->ssc_disabled) && (SCT_ISAUDIO(ssc->es_type))) {
+      if (m->m_config.u.audioes.m_force_type != MC_UNKNOWN) {
+        mc = audioes_muxer_type(ssc->es_type);
+        if (m->m_config.u.audioes.m_force_type != mc)
           continue;
       }
-      if (m->m_config.m_index == count)
+      if (m->m_config.u.audioes.m_index == count)
         return ssc;
       count++;
     }
@@ -104,12 +103,12 @@ audioes_muxer_mime(muxer_t *m, const struct streaming_start *ss)
   muxer_container_type_t mc = MC_UNKNOWN;
   const streaming_start_component_t *ssc;
 
-  if (m->m_config.m_force_type != MC_UNKNOWN)
-    return muxer_container_type2mime(m->m_config.m_force_type, 0);
+  if (m->m_config.u.audioes.m_force_type != MC_UNKNOWN)
+    return muxer_container_type2mime(m->m_config.u.audioes.m_force_type, 0);
 
   ssc = audioes_get_component(m, ss);
   if (ssc)
-    mc = audioes_muxer_type(ssc->ssc_type);
+    mc = audioes_muxer_type(ssc->es_type);
 
   return muxer_container_type2mime(mc, 0);
 }
@@ -128,7 +127,7 @@ audioes_muxer_reconfigure(muxer_t *m, const struct streaming_start *ss)
 
   ssc = audioes_get_component(m, ss);
   if (ssc)
-    am->am_index = ssc->ssc_index;
+    am->am_index = ssc->es_index;
 
   return 0;
 }
@@ -228,10 +227,13 @@ audioes_muxer_write_pkt(muxer_t *m, streaming_message_type_t smt, void *data)
       am->m_eos = 1;
     }
     am->m_errors++;
-    muxer_cache_update(m, am->am_fd, am->am_off, 0);
-    am->am_off = lseek(am->am_fd, 0, SEEK_CUR);
+    if (am->am_seekable) {
+      muxer_cache_update(m, am->am_fd, am->am_off, 0);
+      am->am_off = lseek(am->am_fd, 0, SEEK_CUR);
+    }
   } else {
-    muxer_cache_update(m, am->am_fd, am->am_off, 0);
+    if (am->am_seekable)
+      muxer_cache_update(m, am->am_fd, am->am_off, 0);
     am->am_off += size;
   }
 
@@ -281,6 +283,8 @@ audioes_muxer_destroy(muxer_t *m)
 
   if (am->am_filename)
     free(am->am_filename);
+  muxer_config_free(&am->m_config);
+  muxer_hints_free(am->m_hints);
   free(am);
 }
 
@@ -289,7 +293,8 @@ audioes_muxer_destroy(muxer_t *m)
  * Create a new builtin muxer
  */
 muxer_t*
-audioes_muxer_create(const muxer_config_t *m_cfg)
+audioes_muxer_create(const muxer_config_t *m_cfg,
+                     const muxer_hints_t *hints)
 {
   audioes_muxer_t *am;
 
